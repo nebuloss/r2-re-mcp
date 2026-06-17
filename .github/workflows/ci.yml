@@ -1,0 +1,27 @@
+name: CI
+
+# Typecheck-only CI. radare2 is NOT installed on GitHub runners, so we do NOT
+# run the r2-dependent integration tests here (test/smoke.mjs needs a live r2
+# MCP server — run that against a deployed container instead, see README).
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build (typecheck via tsc)
+        run: npm run build

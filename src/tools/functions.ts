@@ -17,8 +17,16 @@ import {
   resolveAddr,
   applyThumbHint,
   isThumbAt,
+  paginate,
+  grepLines,
 } from "./common.js";
 import { addrArg } from "../util.js";
+
+/** Shared pagination params for high-volume tools. */
+const pageParams = {
+  offset: z.number().int().optional().describe("Pagination start index (default 0)."),
+  limit: z.number().int().optional().describe("Max rows/instructions to return from offset."),
+};
 
 export function registerFunctionTools(server: McpServer, sm: SessionManager): void {
   // list_functions — aflj → compact rows.
@@ -32,9 +40,10 @@ export function registerFunctionTools(server: McpServer, sm: SessionManager): vo
       inputSchema: {
         target: z.string().describe("Open session name."),
         filter: z.string().optional().describe("Case-insensitive substring filter on the name."),
+        ...pageParams,
       },
     },
-    async ({ target, filter }) =>
+    async ({ target, filter, offset, limit }) =>
       guard(async () => {
         const h = sm.get(target);
         let rows: any[] = (await h.cmdj("aflj")) ?? [];
@@ -49,16 +58,16 @@ export function registerFunctionTools(server: McpServer, sm: SessionManager): vo
         if (filtered.length === 0) {
           return capped(`(no functions matching "${filter}")`);
         }
-        const lines = filtered.slice(0, 400).map((r) => {
+        const { slice, footer } = paginate(filtered, offset, limit);
+        const lines = slice.map((r) => {
           const addr = hex(r.addr ?? r.offset);
           const size = r.size ?? 0;
           const nargs = r.nargs ?? 0;
           const nbbs = r.nbbs ?? 0;
           return `${addr}  size=${size}  args=${nargs}  bbs=${nbbs}  ${r.name ?? "?"}`;
         });
-        let header = `${filtered.length} function(s)`;
-        if (filtered.length > 400) header += " (showing first 400)";
-        return capped(header + ":\n" + lines.join("\n"));
+        const header = `${filtered.length} function(s)`;
+        return capped(header + ":\n" + lines.join("\n") + footer);
       })
   );
 
@@ -134,15 +143,18 @@ export function registerFunctionTools(server: McpServer, sm: SessionManager): vo
       description:
         "Full disassembly of the function (addr-or-name) via `pdf`. Thumb-aware: if the function " +
         "region is Thumb it applies `e asm.bits=16; ahb 16` over its extent first. Capped. " +
-        "LIMITATION: mixed ARM/Thumb tails may still mis-decode — use thumb_disasm on a sub-addr.",
+        "LIMITATION: mixed ARM/Thumb tails may still mis-decode — use thumb_disasm on a sub-addr. " +
+        "Optional `grep` filters output lines (case-insensitive regex; substring fallback) before capping.",
       inputSchema: {
         target: z.string().describe("Open session name."),
         target_fn: z
           .union([z.string(), z.number()])
           .describe("Function address (firmware-VA) or name."),
+        grep: z.string().optional().describe("Filter output to matching lines (case-insensitive regex; substring fallback)."),
+        ...pageParams,
       },
     },
-    async ({ target, target_fn }) =>
+    async ({ target, target_fn, grep, offset, limit }) =>
       guard(async () => {
         const h = sm.get(target);
         const a = await resolveAddr(h, target_fn);
@@ -157,9 +169,20 @@ export function registerFunctionTools(server: McpServer, sm: SessionManager): vo
         if (thumb) {
           await applyThumbHint(h, a, info.size);
         }
-        const out = await h.cmd(`pdf @ ${a}`);
-        const header = `# ${info.name ?? a} @ ${a}${thumb ? " (Thumb)" : ""}\n`;
-        return capped(header + (out && out.trim() ? out : "(no disassembly — function may be undefined)"));
+        let out = await h.cmd(`pdf @ ${a}`);
+        let header = `# ${info.name ?? a} @ ${a}${thumb ? " (Thumb)" : ""}\n`;
+        if (!out || !out.trim()) {
+          return capped(header + "(no disassembly — function may be undefined)");
+        }
+        // grep filter BEFORE pagination/cap.
+        if (grep) out = grepLines(out, grep);
+        // Window over instruction lines BEFORE capping when paginating.
+        let body = out;
+        if (offset !== undefined || limit !== undefined) {
+          const { slice, footer } = paginate(out.split("\n"), offset, limit);
+          body = slice.join("\n") + footer;
+        }
+        return capped(header + body);
       })
   );
 

@@ -66,6 +66,57 @@ export async function applyThumbHint(
 /** Resolve an addr-or-name argument; thin re-export so tool modules import one place. */
 export { resolveAddr };
 
+/**
+ * Window an array of rows by `offset`/`limit` BEFORE formatting/capping, and
+ * return the slice plus a footer describing the window. Keeps default behavior
+ * intact: with no offset/limit the whole array passes through and footer="".
+ *
+ * The footer (when windowed) reads:
+ *   [showing N..M of TOTAL — pass offset=M to continue]
+ * so the caller can paginate the high-volume tools without flooding context.
+ */
+export function paginate<T>(
+  rows: T[],
+  offset?: number,
+  limit?: number
+): { slice: T[]; footer: string; start: number; end: number; total: number } {
+  const total = rows.length;
+  const start = Math.max(0, Math.floor(offset ?? 0));
+  const end =
+    limit !== undefined && limit !== null
+      ? Math.min(total, start + Math.max(0, Math.floor(limit)))
+      : total;
+  const slice = rows.slice(start, end);
+  const windowed = start > 0 || end < total;
+  const footer = windowed
+    ? `\n[showing ${start}..${end} of ${total}` +
+      (end < total ? ` — pass offset=${end} to continue]` : "]")
+    : "";
+  return { slice, footer, start, end, total };
+}
+
+/**
+ * Filter disasm text to only lines matching `pattern` (case-insensitive).
+ * Treated as a regex; if the pattern is not a valid regex it falls back to a
+ * plain (case-insensitive) substring match. Appends a footer
+ * `[grep "<pat>": <kept>/<total> lines]`. Mirrors agents piping r2 output
+ * through `grep -iE '…'`. Apply BEFORE capOutput.
+ */
+export function grepLines(text: string, pattern: string): string {
+  const lines = text.split("\n");
+  let test: (l: string) => boolean;
+  try {
+    const re = new RegExp(pattern, "i");
+    test = (l) => re.test(l);
+  } catch {
+    const needle = pattern.toLowerCase();
+    test = (l) => l.toLowerCase().includes(needle);
+  }
+  const kept = lines.filter(test);
+  const footer = `\n[grep "${pattern}": ${kept.length}/${lines.length} lines]`;
+  return kept.join("\n") + footer;
+}
+
 /** Detect whether the function/region at `addr` is Thumb per r2's analysis. */
 export async function isThumbAt(handle: R2Handle, addr: string): Promise<boolean> {
   try {

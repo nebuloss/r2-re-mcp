@@ -5,7 +5,8 @@
  * (slow, and analysis state is lost). Here we keep ONE persistent r2pipe handle
  * per opened target, keyed by a friendly `name`, reused across every tool call.
  * Flags/comments/analysis accumulate in-process and can be persisted with the
- * r2 project commands (Ps/Po) — see tools.ts save_project / open_target.
+ * r2 project commands (Ps/P + dir.projects) — see tools.ts save_project /
+ * open_target.
  *
  * ADDRESSING NOTE (bake-in): in r2 the addresses ARE the firmware virtual
  * address directly. For the raw dongle blob `ram.shift.bin` the load base is 0,
@@ -29,6 +30,19 @@ export const RE_BINS = process.env.RE_BINS ?? "/opt/re-bins";
 export const R2_PROJECT_DIR =
   process.env.R2_PROJECT_DIR ?? path.join(RE_BINS, ".r2projects");
 
+/**
+ * Sanitize a session/target name into an r2-safe PROJECT name.
+ *
+ * ROOT CAUSE this fixes: r2 6.1.7 REJECTS project names containing dots —
+ * `Ps ram.shift.bin` → "Invalid project name" — so saves silently failed and
+ * reopen never loaded. Every char outside [A-Za-z0-9_] is replaced with `_`
+ * (so `ram.shift.bin` → `ram_shift_bin`). The same function MUST be used for
+ * BOTH save (`Ps`) and load (`P`) so the names match on disk.
+ */
+export function projName(name: string): string {
+  return name.replace(/[^A-Za-z0-9_]/g, "_");
+}
+
 /** A thin async wrapper around the callback-style r2pipe handle. */
 export interface R2Handle {
   cmd(command: string): Promise<string>;
@@ -45,33 +59,68 @@ interface Session {
   handle: R2Handle;
 }
 
-/** Promisify the r2pipe callback handle returned by r2pipe.open(). */
+/**
+ * Promisify the r2pipe callback handle returned by r2pipe.open().
+ *
+ * SERIALIZATION (correctness, top priority): r2pipe is a SINGLE pipe — if two
+ * tool calls write commands concurrently their output interleaves and corrupts.
+ * This server is driven by PARALLEL agents on the same target, so every
+ * `cmd`/`cmdj` is funnelled through a per-handle promise-chain mutex: each
+ * command awaits the previous one before touching the pipe. `quit()` enqueues on
+ * the same chain so it only closes after all in-flight commands have drained.
+ */
 function wrap(raw: any): R2Handle {
+  // The mutex tail: a promise that resolves when the last queued op finishes.
+  // We chain each new op onto it so writes to the pipe are strictly serialized.
+  let chain: Promise<unknown> = Promise.resolve();
+
+  /** Enqueue `op` behind everything already queued; isolate failures so one
+   *  rejected command does not poison the chain for subsequent commands. */
+  function enqueue<T>(op: () => Promise<T>): Promise<T> {
+    const run = chain.then(op, op); // run regardless of prior outcome
+    // Keep the tail alive but swallow rejection so the chain never stays rejected.
+    chain = run.then(
+      () => undefined,
+      () => undefined
+    );
+    return run;
+  }
+
+  const rawCmd = (command: string): Promise<string> =>
+    new Promise((resolve, reject) => {
+      raw.cmd(command, (err: any, res: string) => {
+        if (err) reject(err);
+        else resolve(res ?? "");
+      });
+    });
+
+  const rawCmdj = (command: string): Promise<any> =>
+    new Promise((resolve, reject) => {
+      raw.cmdj(command, (err: any, res: any) => {
+        if (err) reject(err);
+        else resolve(res);
+      });
+    });
+
   return {
     cmd(command: string): Promise<string> {
-      return new Promise((resolve, reject) => {
-        raw.cmd(command, (err: any, res: string) => {
-          if (err) reject(err);
-          else resolve(res ?? "");
-        });
-      });
+      return enqueue(() => rawCmd(command));
     },
     cmdj(command: string): Promise<any> {
-      return new Promise((resolve, reject) => {
-        raw.cmdj(command, (err: any, res: any) => {
-          if (err) reject(err);
-          else resolve(res);
-        });
-      });
+      return enqueue(() => rawCmdj(command));
     },
     quit(): Promise<void> {
-      return new Promise((resolve) => {
-        try {
-          raw.quit(() => resolve());
-        } catch {
-          resolve();
-        }
-      });
+      // Drain in-flight/queued commands first, then close the pipe.
+      return enqueue(
+        () =>
+          new Promise<void>((resolve) => {
+            try {
+              raw.quit(() => resolve());
+            } catch {
+              resolve();
+            }
+          })
+      );
     },
   };
 }
@@ -94,6 +143,8 @@ export interface OpenSummary {
   base: string;
   functions: number;
   projectLoaded: boolean;
+  /** True when a loaded project already carried analysis, so aa/aaa was skipped. */
+  analysisFromProject: boolean;
   reused: boolean;
 }
 
@@ -113,6 +164,11 @@ export class SessionManager {
       );
     }
     return s.handle;
+  }
+
+  /** On-disk path of an open session's binary (for tools that shell out, e.g. radiff2). */
+  filePathOf(name: string): string | undefined {
+    return this.sessions.get(name)?.filePath;
   }
 
   list(): { name: string; file: string; arch: string; bits: number }[] {
@@ -152,6 +208,7 @@ export class SessionManager {
         base: "0x" + s.baseAddr.toString(16),
         functions: funcs,
         projectLoaded: false,
+        analysisFromProject: false,
         reused: true,
       };
     }
@@ -179,30 +236,45 @@ export class SessionManager {
     });
     const handle = wrap(raw);
 
-    // Analysis depth (default "basic"=aa). xref/function tools need at least
-    // basic, ideally "full" (aaa). "none" skips entirely (fast open, but the
-    // function/xref tools will be empty until analyze() is called).
-    if (analysis !== "none") {
+    // Auto-load a matching r2 project FIRST (before any aa/aaa). If a project
+    // exists it already carries the analysis (functions/flags/comments), so we
+    // can skip the expensive re-analysis entirely and reopen is near-instant.
+    let projectLoaded = false;
+    try {
+      // On-disk project is a directory `${R2_PROJECT_DIR}/${projName}/` holding
+      // `rc.r2`. The name MUST be sanitized (dots are illegal in r2 project
+      // names) and must match what saveProject wrote.
+      const pn = projName(name);
+      if (fs.existsSync(path.join(R2_PROJECT_DIR, pn, "rc.r2"))) {
+        await handle.cmd(`e dir.projects=${R2_PROJECT_DIR}`);
+        const res = await handle.cmd(`P ${pn}`);
+        // `ERROR: ar: Unknown register` lines ALWAYS appear on load and are
+        // harmless — filter them out before deciding success/failure.
+        const filtered = res
+          .split("\n")
+          .filter((l) => !/ERROR:\s*ar:\s*Unknown register/i.test(l))
+          .join("\n");
+        projectLoaded = !/invalid|error|cannot|no such/i.test(filtered);
+        log.info(`project load (P ${pn}) -> ${projectLoaded ? "ok" : "noop"}`);
+      }
+    } catch (e) {
+      log.warn(`project auto-load failed for ${name}: ${errMsg(e)}`);
+    }
+
+    // If a project loaded with functions, treat analysis as already present and
+    // SKIP aa/aaa. Otherwise run the requested depth (default "basic"=aa).
+    // "none" skips entirely (fast open; function/xref tools empty until analyze()).
+    let analysisFromProject = false;
+    if (projectLoaded && (await this.functionCount(handle)) > 0) {
+      analysisFromProject = true;
+      log.info(`"${name}": analysis recovered from project — skipping ${analysis}`);
+    } else if (analysis !== "none") {
       const cmd = analysis === "full" ? "aaa" : "aa";
       try {
         await handle.cmd(cmd);
       } catch (e) {
         log.warn(`${cmd} failed for ${name}: ${errMsg(e)}`);
       }
-    }
-
-    // Auto-load matching r2 project if one exists (Po <name>).
-    let projectLoaded = false;
-    try {
-      const projFile = path.join(R2_PROJECT_DIR, name);
-      if (fs.existsSync(projFile) || fs.existsSync(projFile + ".rzdb") || fs.existsSync(projFile + ".r2")) {
-        await handle.cmd(`e prj.dir=${R2_PROJECT_DIR}`);
-        const res = await handle.cmd(`Po ${name}`);
-        projectLoaded = !/Cannot|No such|error/i.test(res);
-        log.info(`project load (Po ${name}) -> ${projectLoaded ? "ok" : "noop"}`);
-      }
-    } catch (e) {
-      log.warn(`project auto-load failed for ${name}: ${errMsg(e)}`);
     }
 
     const session: Session = { name, filePath, arch, bits, baseAddr, handle };
@@ -218,8 +290,40 @@ export class SessionManager {
       base: "0x" + baseAddr.toString(16),
       functions,
       projectLoaded,
+      analysisFromProject,
       reused: false,
     };
+  }
+
+  /**
+   * Best-effort save of the in-session analysis/flags/comments to an r2 project
+   * (`e dir.projects=<dir>; Ps <projName>`). Returns a short status string;
+   * NEVER throws — callers (analyze/save_project) treat persistence as
+   * best-effort. The name is sanitized (see projName): r2 rejects dots in
+   * project names, which is why unsanitized saves silently failed.
+   */
+  async saveProject(name: string): Promise<{ ok: boolean; where: string; note: string }> {
+    const pn = projName(name);
+    const where = path.join(R2_PROJECT_DIR, pn);
+    const h = this.get(name);
+    try {
+      fs.mkdirSync(R2_PROJECT_DIR, { recursive: true });
+    } catch (e) {
+      log.warn(`mkdir ${R2_PROJECT_DIR}: ${errMsg(e)}`);
+    }
+    try {
+      await h.cmd(`e dir.projects=${R2_PROJECT_DIR}`);
+      const res = await h.cmd(`Ps ${pn}`);
+      // ADD "invalid" — r2's rejection of bad project names is "Invalid project
+      // name", which the old regex missed (so the save falsely reported ok).
+      const bad = /invalid|error|cannot|no such/i.test(res);
+      if (bad) log.warn(`Ps ${pn} reported: ${res.trim()}`);
+      return { ok: !bad, where, note: bad ? res.trim() : "" };
+    } catch (e) {
+      const msg = errMsg(e);
+      log.warn(`save project ${name} failed: ${msg}`);
+      return { ok: false, where, note: msg };
+    }
   }
 
   async close(name: string): Promise<boolean> {

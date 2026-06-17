@@ -37,7 +37,7 @@ const sessions = new SessionManager();
 function buildServer(): McpServer {
   const server = new McpServer({
     name: "r2-re-mcp",
-    version: "2.0.0",
+    version: "2.2.0",
   });
   registerTools(server, sessions);
   return server;

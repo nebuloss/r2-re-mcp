@@ -21,16 +21,22 @@ export function registerAnalysisTools(server: McpServer, sm: SessionManager): vo
         "Run radare2 analysis on an open target to populate functions/xrefs. " +
         "depth: 'basic'=aa | 'full'=aaa | 'refs'=aar then aac (xrefs+calls) | " +
         "'emu'=aae/aaae (ESIL-assisted). The function/xref/callgraph tools need at " +
-        "least 'basic', ideally 'full'. NOTE: can be slow on a ~5MB blob (aaa/emu).",
+        "least 'basic', ideally 'full'. NOTE: can be slow on a ~5MB blob (aaa/emu). " +
+        "On completion the r2 project is auto-saved (best-effort) so a reopen is instant " +
+        "(set save:false to skip).",
       inputSchema: {
         target: z.string().describe("Open session name."),
         depth: z
           .enum(["basic", "full", "refs", "emu"])
           .optional()
           .describe("Analysis depth, default 'full'."),
+        save: z
+          .boolean()
+          .optional()
+          .describe("Auto-save the r2 project after analysis (default true, best-effort)."),
       },
     },
-    async ({ target, depth }) =>
+    async ({ target, depth, save }) =>
       guard(async () => {
         const h = sm.get(target);
         const d = depth ?? "full";
@@ -53,7 +59,15 @@ export function registerAnalysisTools(server: McpServer, sm: SessionManager): vo
         } catch {
           /* ignore */
         }
-        return capped(`analysis '${d}' done on "${target}": ${count} function(s).`);
+        // Auto-persist (best-effort) so re-running aaa (~32s) isn't needed next open.
+        let saveNote = "";
+        if (save !== false) {
+          const r = await sm.saveProject(target);
+          saveNote = r.ok
+            ? ` project saved -> ${r.where}.`
+            : ` (project save best-effort failed: ${r.note}).`;
+        }
+        return capped(`analysis '${d}' done on "${target}": ${count} function(s).${saveNote}`);
       })
   );
 

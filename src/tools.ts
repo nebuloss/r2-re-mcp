@@ -19,20 +19,20 @@
 
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import * as path from "node:path";
-import * as fs from "node:fs";
 import {
   SessionManager,
-  R2_PROJECT_DIR,
   type R2Handle,
 } from "./sessions.js";
 import { capOutput, addrArg, errMsg, log } from "./util.js";
-import { text, fail, guard } from "./tools/common.js";
+import { text, fail, guard, paginate, grepLines } from "./tools/common.js";
 import { registerAnalysisTools } from "./tools/analysis.js";
 import { registerTriageTools } from "./tools/triage.js";
 import { registerFunctionTools } from "./tools/functions.js";
 import { registerCallgraphTools } from "./tools/callgraph.js";
 import { registerEmulateTools } from "./tools/emulate.js";
+import { registerSymbolTools } from "./tools/symbols.js";
+import { registerTypeTools } from "./tools/types.js";
+import { registerDiffTools } from "./tools/diff.js";
 
 /**
  * Probe which decompiler commands are available in this r2 build, in order of
@@ -89,6 +89,11 @@ function formatXrefs(
   return header + ":\n" + lines.join("\n");
 }
 
+/** Build the optional tmp-arch suffix for a `pd` command (VALIDATED: `@a:arm:64`). */
+function archSuffix(arch?: string, bits?: number): string {
+  return arch && bits ? ` @a:${arch}:${bits}` : "";
+}
+
 export function registerTools(server: McpServer, sm: SessionManager): void {
   // ---------------------------------------------------------------------------
   // 1. open_target — open/reuse a persistent session, light-analyze, auto-load project.
@@ -126,7 +131,8 @@ export function registerTools(server: McpServer, sm: SessionManager): void {
           `  arch/bits: ${s.arch}/${s.bits}\n` +
           `  base:      ${s.base}\n` +
           `  functions: ${s.functions}\n` +
-          `  project:   ${s.projectLoaded ? "loaded (Po)" : "none"}`;
+          `  project:   ${s.projectLoaded ? "loaded (P, sanitized name)" : "none"}` +
+          (s.analysisFromProject ? "\n  analysis:  recovered from project (skipped aa/aaa)" : "");
         return text(capOutput(out));
       })
   );
@@ -167,17 +173,84 @@ export function registerTools(server: McpServer, sm: SessionManager): void {
     "disasm",
     {
       title: "Disassemble (ARM)",
-      description: "ARM disassembly: `pd n @addr`. For Thumb code use thumb_disasm instead.",
+      description:
+        "ARM disassembly: `pd n @addr`. For Thumb code use thumb_disasm instead. " +
+        "Supports offset/limit pagination (windows the disasm lines). " +
+        "Optional per-call `arch`+`bits` override (BOTH required) appends `@a:<arch>:<bits>` — " +
+        "the clean per-call alternative to thumb_disasm's global `ahb` (e.g. arch='arm',bits=16 " +
+        "for Thumb; bits=64 for aarch64 targets like dhd.ko). Optional `grep` filters output " +
+        "lines (case-insensitive regex, substring fallback) before capping.",
       inputSchema: {
         target: z.string().describe("Open session name."),
         addr: z.union([z.string(), z.number()]).describe("Firmware-VA or symbol."),
         n: z.number().int().optional().describe("Instruction count, default 32."),
+        arch: z.string().optional().describe("Per-call arch override (use WITH bits), e.g. 'arm'."),
+        bits: z.number().int().optional().describe("Per-call bits override (use WITH arch): 16=Thumb, 64=aarch64."),
+        grep: z.string().optional().describe("Filter output to matching lines (case-insensitive regex; substring fallback)."),
+        offset: z.number().int().optional().describe("Pagination start line (default 0)."),
+        limit: z.number().int().optional().describe("Max disasm lines to return from offset."),
       },
     },
-    async ({ target, addr, n }) =>
+    async ({ target, addr, n, arch, bits, grep, offset, limit }) =>
       guard(async () => {
         const h = sm.get(target);
-        const out = await h.cmd(`pd ${n ?? 32} @ ${addrArg(addr)}`);
+        let out = await h.cmd(`pd ${n ?? 32} @ ${addrArg(addr)}${archSuffix(arch, bits)}`);
+        if (grep) out = grepLines(out, grep);
+        if (offset !== undefined || limit !== undefined) {
+          const { slice, footer } = paginate(out.split("\n"), offset, limit);
+          return text(capOutput(slice.join("\n") + footer));
+        }
+        return text(capOutput(out));
+      })
+  );
+
+  // ---------------------------------------------------------------------------
+  // 3b. disasm_batch — disassemble several regions in ONE call (token saver).
+  // ---------------------------------------------------------------------------
+  server.registerTool(
+    "disasm_batch",
+    {
+      title: "Disassemble multiple regions",
+      description:
+        "Disassemble several regions in ONE call. Each region: `addr` (+ optional `n` default 24, " +
+        "per-region `arch`+`bits` override appending `@a:<arch>:<bits>`, and a `label`). Each block " +
+        "is prefixed with a `=== <label|addr> ===` marker, then the whole thing is capped. " +
+        "Optional top-level `grep` filters the combined output (case-insensitive regex; substring " +
+        "fallback). Mirrors the agent pattern of disassembling several regions with marker separators. " +
+        "Max 20 regions.",
+      inputSchema: {
+        target: z.string().describe("Open session name."),
+        regions: z
+          .array(
+            z.object({
+              addr: z.union([z.string(), z.number()]).describe("Firmware-VA or symbol."),
+              n: z.number().int().optional().describe("Instruction count, default 24."),
+              arch: z.string().optional().describe("Per-region arch override (use WITH bits)."),
+              bits: z.number().int().optional().describe("Per-region bits override (use WITH arch)."),
+              label: z.string().optional().describe("Marker header label (defaults to the addr)."),
+            })
+          )
+          .describe("Regions to disassemble (max 20)."),
+        grep: z.string().optional().describe("Filter combined output to matching lines (case-insensitive regex; substring fallback)."),
+      },
+    },
+    async ({ target, regions, grep }) =>
+      guard(async () => {
+        const h = sm.get(target);
+        if (!Array.isArray(regions) || regions.length === 0) {
+          return fail("disasm_batch: provide a non-empty `regions` array.");
+        }
+        const capped20 = regions.slice(0, 20);
+        const blocks: string[] = [];
+        for (const r of capped20) {
+          const a = addrArg(r.addr);
+          const header = `=== ${r.label ?? a} ===`;
+          const body = await h.cmd(`pd ${r.n ?? 24} @ ${a}${archSuffix(r.arch, r.bits)}`);
+          blocks.push(`${header}\n${body}`);
+        }
+        let out = blocks.join("\n");
+        if (regions.length > 20) out += `\n[disasm_batch: capped to first 20 of ${regions.length} regions]`;
+        if (grep) out = grepLines(out, grep);
         return text(capOutput(out));
       })
   );
@@ -316,9 +389,11 @@ export function registerTools(server: McpServer, sm: SessionManager): void {
         target: z.string().describe("Open session name."),
         query: z.string().describe("Hex byte string, text, or numeric value depending on kind."),
         kind: z.enum(["bytes", "string", "value"]).optional().describe("Search kind, default 'string'."),
+        offset: z.number().int().optional().describe("Pagination start index over hits (default 0)."),
+        limit: z.number().int().optional().describe("Max hits to return from offset."),
       },
     },
-    async ({ target, query, kind }) =>
+    async ({ target, query, kind, offset, limit }) =>
       guard(async () => {
         const h = sm.get(target);
         const k = kind ?? "string";
@@ -327,8 +402,15 @@ export function registerTools(server: McpServer, sm: SessionManager): void {
         else if (k === "value") cmd = `/v ${query}`;
         else cmd = `/ ${query}`;
         const out = await h.cmd(cmd);
-        const body = out && out.trim() ? out : `(no hits for ${k} search: ${query})`;
-        return text(capOutput(body));
+        if (!out || !out.trim()) {
+          return text(capOutput(`(no hits for ${k} search: ${query})`));
+        }
+        if (offset !== undefined || limit !== undefined) {
+          const hits = out.split("\n").filter((l) => l.trim() !== "");
+          const { slice, footer } = paginate(hits, offset, limit);
+          return text(capOutput(slice.join("\n") + footer));
+        }
+        return text(capOutput(out));
       })
   );
 
@@ -372,17 +454,10 @@ export function registerTools(server: McpServer, sm: SessionManager): void {
     },
     async ({ target }) =>
       guard(async () => {
-        const h = sm.get(target);
-        try {
-          fs.mkdirSync(R2_PROJECT_DIR, { recursive: true });
-        } catch (e) {
-          log.warn(`mkdir ${R2_PROJECT_DIR}: ${errMsg(e)}`);
-        }
-        await h.cmd(`e prj.dir=${R2_PROJECT_DIR}`);
-        const res = await h.cmd(`Ps ${target}`);
-        const where = path.join(R2_PROJECT_DIR, target);
-        const note = /error|cannot/i.test(res) ? ` (r2 said: ${res.trim()})` : "";
-        return text(capOutput(`saved project "${target}" -> ${where}${note}`));
+        sm.get(target); // guard: clean error if not open
+        const r = await sm.saveProject(target);
+        const note = r.ok ? "" : ` (best-effort: r2 said: ${r.note})`;
+        return text(capOutput(`saved project "${target}" -> ${r.where}${note}`));
       })
   );
 
@@ -440,4 +515,7 @@ export function registerTools(server: McpServer, sm: SessionManager): void {
   registerFunctionTools(server, sm);
   registerCallgraphTools(server, sm);
   registerEmulateTools(server, sm);
+  registerSymbolTools(server, sm);
+  registerTypeTools(server, sm);
+  registerDiffTools(server, sm);
 }
