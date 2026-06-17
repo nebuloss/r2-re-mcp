@@ -1,0 +1,38 @@
+{
+  "name": "@nebuloss/r2-re-mcp",
+  "version": "2.0.0",
+  "description": "Stateful, token-disciplined, recipe-encoded radare2 MCP server for GT-BE98 / BCM6726b0 firmware reverse-engineering.",
+  "type": "module",
+  "private": true,
+  "license": "MIT",
+  "author": "nebuloss",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nebuloss/r2-re-mcp.git"
+  },
+  "bugs": {
+    "url": "https://github.com/nebuloss/r2-re-mcp/issues"
+  },
+  "homepage": "https://github.com/nebuloss/r2-re-mcp#readme",
+  "engines": {
+    "node": ">=20"
+  },
+  "main": "dist/server.js",
+  "bin": {
+    "r2-re-mcp": "dist/server.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/server.js",
+    "dev": "node --loader ts-node/esm src/server.ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "r2pipe": "^2.8.6",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "typescript": "^5.5.0"
+  }
+}

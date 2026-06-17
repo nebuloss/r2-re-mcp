@@ -1,0 +1,29 @@
+# re-r2-mcp.service
+# ---------------------------------------------------------------------------
+# Custom lean radare2 RE MCP server for the GT-BE98 / BCM6726b0 effort.
+# Runs ALONGSIDE the stock r2mcp (r2mcp.service on :8765) on a NEW port
+# (default 8766) during trial — it does NOT clobber the existing service.
+#
+# Install on the RE MCP container (10.0.50.147):
+#   cp systemd/re-r2-mcp.service /etc/systemd/system/
+#   systemctl daemon-reload && systemctl enable --now re-r2-mcp
+# Expects the built server at /opt/r2-re-mcp/dist/server.js (npm run build).
+# ---------------------------------------------------------------------------
+[Unit]
+Description=Custom radare2 RE MCP (stateful, token-capped, streamable-http :8766) — alongside stock r2mcp :8765
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/r2-re-mcp
+Environment=HOME=/root
+Environment=R2_MCP_PORT=8766
+Environment=RE_BINS=/opt/re-bins
+Environment=R2_PROJECT_DIR=/opt/re-bins/.r2projects
+Environment=LOG_LEVEL=info
+ExecStart=/usr/bin/node /opt/r2-re-mcp/dist/server.js
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
