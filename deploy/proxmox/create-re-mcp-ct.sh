@@ -16,7 +16,18 @@ CORES="${CORES:-4}"
 MEMORY="${MEMORY:-8192}"     # Ghidra headless ~5G heap
 DISK="${DISK:-40}"
 BRIDGE="${BRIDGE:-vmbr0}"
+TAG="${TAG:-}"               # VLAN tag for net0 (e.g. TAG=50); empty = untagged
 PROVISION_URL="${PROVISION_URL:-https://raw.githubusercontent.com/nebuloss/r2-re-mcp/main/deploy/provision-re-mcp-server.sh}"
+
+# Validate STORAGE can hold a container rootfs; if the default isn't present on
+# this host (e.g. ZFS hosts have 'local-zfs', not 'local-lvm'), auto-pick the
+# first active rootdir-capable storage so the script is portable across nodes.
+if ! pvesm status --content rootdir 2>/dev/null | awk 'NR>1{print $1}' | grep -qx "$STORAGE"; then
+  ALT=$(pvesm status --content rootdir 2>/dev/null | awk 'NR>1 && $3=="active"{print $1; exit}')
+  [ -n "$ALT" ] || { echo "no active rootdir-capable storage found (set STORAGE=)"; exit 1; }
+  echo "storage '$STORAGE' unavailable for rootdir on this node -> using '$ALT'"
+  STORAGE="$ALT"
+fi
 
 echo "== fetching a Debian 13 template =="
 pveam update >/dev/null 2>&1 || true
@@ -29,7 +40,7 @@ pct create "$CTID" "${TEMPLATE_STORAGE}:vztmpl/${TMPL}" \
   --hostname "$CT_HOSTNAME" \
   --cores "$CORES" --memory "$MEMORY" --swap 512 \
   --rootfs "${STORAGE}:${DISK}" \
-  --net0 "name=eth0,bridge=${BRIDGE},ip=dhcp" \
+  --net0 "name=eth0,bridge=${BRIDGE}${TAG:+,tag=${TAG}},ip=dhcp" \
   --features nesting=1 \
   --unprivileged 1 --onboot 1
 

@@ -34,6 +34,8 @@ PORT_GHIDRA_BACKEND=8089                 # headless REST (loopback only)
 PORT_GHIDRA_MCP=8081                     # bridge (LAN)
 PORT_R2MCP="$R2_MCP_PORT"                # custom r2-re-mcp server
 PORT_FS_MCP=8082
+MCPPROXY_VERSION="${MCPPROXY_VERSION:-0.40.0}"   # smart-mcp-proxy/mcpproxy-go (single aggregated endpoint)
+PORT_MCPPROXY="${PORT_MCPPROXY:-8090}"           # the SINGLE MCP interface this LXC exposes
 log(){ echo -e "\n\033[1;32m== $* ==\033[0m"; }
 
 [ "$(id -u)" = 0 ] || { echo "run as root"; exit 1; }
@@ -84,8 +86,20 @@ if [ ! -d "$GHIDRA_MCP_DIR/.git" ]; then
 else
   git -C "$GHIDRA_MCP_DIR" pull --ff-only || true
 fi
-# build the plugin/headless jar (maven; output in target/GhidraMCP-*.jar)
-( cd "$GHIDRA_MCP_DIR" && GHIDRA_INSTALL_DIR="$GHIDRA_HOME" mvn -q -DskipTests clean package )
+# Build the plugin/headless jar via the repo's setup tool (output target/GhidraMCP-*.jar).
+# NOTE: current GhidraMCP requires its Ghidra jars installed into the local maven repo
+# FIRST (`install-ghidra-deps`, which reads --ghidra-path/GHIDRA_PATH) — raw
+# `mvn clean package` fails with "Could not find artifact ghidra:*:jar in central".
+# `build` then compiles using the installed .m2 jars (it does NOT accept --ghidra-path).
+( cd "$GHIDRA_MCP_DIR" \
+  && python3 -m tools.setup install-ghidra-deps --ghidra-path "$GHIDRA_HOME" \
+  && GHIDRA_PATH="$GHIDRA_HOME" python3 -m tools.setup build )
+# Headless server launch: current GhidraMCP dropped run_headless_server.sh; the
+# headless server is launched by docker/entrypoint.sh (builds the Ghidra classpath
+# from GHIDRA_HOME, runs GhidraMCPHeadlessServer) and expects the jar at
+# /app/GhidraMCP.jar. Stage both for the systemd unit. (entrypoint.sh may lack +x.)
+chmod +x "$GHIDRA_MCP_DIR/docker/entrypoint.sh"
+mkdir -p /app && cp -f "$GHIDRA_MCP_DIR"/target/GhidraMCP-*.jar /app/GhidraMCP.jar
 # python deps for the streamable-http bridge
 pip3 install --break-system-packages -r "$GHIDRA_MCP_DIR/requirements.txt"
 mkdir -p "$GHIDRA_PROJECT_DIR"
@@ -148,7 +162,11 @@ Environment=GHIDRA_MCP_BIND_ADDRESS=127.0.0.1
 # exposure is via the bridge on the lab subnet. Set GHIDRA_MCP_AUTH_TOKEN here
 # AND in ghidra-mcp.service if the bridge is reachable beyond a trusted net.
 Environment=GHIDRA_MCP_ALLOW_SCRIPTS=1
-ExecStart=${GHIDRA_MCP_DIR}/run_headless_server.sh --project ${GHIDRA_PROJECT_DIR}
+Environment=PROJECT_PATH=${GHIDRA_PROJECT_DIR}
+Environment="JAVA_OPTS=-Xmx5g -XX:+UseG1GC"
+# Launch via the repo's entrypoint (builds Ghidra classpath, runs GhidraMCPHeadlessServer);
+# reads GHIDRA_HOME/GHIDRA_MCP_PORT/GHIDRA_MCP_BIND_ADDRESS/PROJECT_PATH; jar at /app/GhidraMCP.jar.
+ExecStart=/usr/bin/bash ${GHIDRA_MCP_DIR}/docker/entrypoint.sh
 Restart=on-failure
 RestartSec=5
 TimeoutStartSec=300
@@ -200,8 +218,47 @@ RestartSec=5
 WantedBy=multi-user.target
 EOF
 
+# ---- mcpproxy: the SINGLE aggregated MCP endpoint this LXC exposes ---------
+# smart-mcp-proxy/mcpproxy-go — one binary, no DB; transparently fronts all the
+# local MCP servers behind one endpoint. Add/remove a backend = edit this config
+# (agents keep using the one endpoint, unchanged).
+log "mcpproxy (single aggregated MCP endpoint :${PORT_MCPPROXY})"
+if [ ! -x /usr/local/bin/mcpproxy ]; then
+  curl -fsSL -o /tmp/mcpproxy.tgz \
+    "https://github.com/smart-mcp-proxy/mcpproxy-go/releases/download/v${MCPPROXY_VERSION}/mcpproxy-${MCPPROXY_VERSION}-linux-amd64.tar.gz"
+  tar -xzf /tmp/mcpproxy.tgz -C /tmp
+  install -m 0755 "$(find /tmp -maxdepth 2 -name mcpproxy -type f | head -1)" /usr/local/bin/mcpproxy
+  rm -f /tmp/mcpproxy.tgz
+fi
+mkdir -p /etc/mcpproxy /var/lib/mcpproxy
+cat > /etc/mcpproxy/mcp_config.json <<EOF
+{
+  "listen": "0.0.0.0:${PORT_MCPPROXY}",
+  "mcpServers": [
+    { "name": "ghidra", "url": "http://127.0.0.1:${PORT_GHIDRA_MCP}/mcp", "protocol": "http", "enabled": true },
+    { "name": "r2",     "url": "http://127.0.0.1:${PORT_R2MCP}/mcp", "protocol": "http", "enabled": true },
+    { "name": "files",  "url": "http://127.0.0.1:${PORT_FS_MCP}/mcp", "protocol": "http", "enabled": true }
+  ]
+}
+EOF
+cat > /etc/systemd/system/mcpproxy.service <<EOF
+[Unit]
+Description=MCPProxy — single aggregated MCP endpoint (streamable-http :${PORT_MCPPROXY}) fronting this host's MCP servers
+# Do NOT order After= the upstream MCP units: mcpproxy connects asynchronously and
+# retries; ordering after a perpetually-activating unit would stick this start job.
+After=network.target
+[Service]
+Type=simple
+Environment=HOME=/root
+ExecStart=/usr/local/bin/mcpproxy serve -c /etc/mcpproxy/mcp_config.json -d /var/lib/mcpproxy -l 0.0.0.0:${PORT_MCPPROXY} --log-level info
+Restart=on-failure
+RestartSec=5
+[Install]
+WantedBy=multi-user.target
+EOF
+
 systemctl daemon-reload
-systemctl enable --now ghidra-headless.service ghidra-mcp.service re-r2-mcp.service filesystem-mcp.service
+systemctl enable --now ghidra-headless.service ghidra-mcp.service re-r2-mcp.service filesystem-mcp.service mcpproxy.service
 
 # ---- 6.5 ingest helper (persistent, correct-base project import) ----------
 # Programs load transiently otherwise (lost on restart). Stage the helper next
@@ -221,14 +278,19 @@ fi
 # ---- 7. report ------------------------------------------------------------
 log "status"
 sleep 5
-for s in ghidra-headless ghidra-mcp re-r2-mcp filesystem-mcp; do
+for s in ghidra-headless ghidra-mcp re-r2-mcp filesystem-mcp mcpproxy; do
   printf "%-18s %s\n" "$s" "$(systemctl is-active $s)"
 done
 echo
-echo "Endpoints (front with TLS subdomains on your reverse proxy):"
-echo "  ghidra    -> http://<host>:${PORT_GHIDRA_MCP}/mcp"
-echo "  re-r2-mcp -> http://<host>:${PORT_R2MCP}/mcp  (custom r2-re-mcp server)"
-echo "  files     -> http://<host>:${PORT_FS_MCP}/mcp  (scoped: ${RE_WORK}, ${RE_BINS})"
+echo "SINGLE AGGREGATED MCP ENDPOINT (front THIS one with TLS on your reverse proxy):"
+echo "  mcpproxy  -> http://<host>:${PORT_MCPPROXY}/mcp/   <-- register ONLY this in clients"
+echo "               (transparently fronts ghidra+r2+files; add backends in"
+echo "                /etc/mcpproxy/mcp_config.json — clients stay unchanged)"
+echo
+echo "Backends behind it (loopback; not registered in clients directly):"
+echo "  ghidra    -> http://127.0.0.1:${PORT_GHIDRA_MCP}/mcp"
+echo "  re-r2-mcp -> http://127.0.0.1:${PORT_R2MCP}/mcp  (custom r2-re-mcp server)"
+echo "  files     -> http://127.0.0.1:${PORT_FS_MCP}/mcp  (scoped: ${RE_WORK}, ${RE_BINS})"
 echo
 echo "Stage binaries into ${RE_BINS} (scp or a mount) — do NOT push multi-MB blobs through MCP."
 echo

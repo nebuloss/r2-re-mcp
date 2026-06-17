@@ -57,7 +57,11 @@ msg_ok "Installed Ghidra ${GHIDRA_VERSION}"
 
 msg_info "Building GhidraMCP (bethington/ghidra-mcp)"
 git clone --depth 1 "$GHIDRA_MCP_REPO" "$GHIDRA_MCP_DIR"
-(cd "$GHIDRA_MCP_DIR" && GHIDRA_INSTALL_DIR="$GHIDRA_HOME" $STD mvn -DskipTests clean package)
+# current GhidraMCP needs its Ghidra jars installed into the local maven repo first
+# (install-ghidra-deps reads --ghidra-path); raw `mvn clean package` can't resolve them.
+(cd "$GHIDRA_MCP_DIR" \
+  && $STD python3 -m tools.setup install-ghidra-deps --ghidra-path "$GHIDRA_HOME" \
+  && GHIDRA_PATH="$GHIDRA_HOME" $STD python3 -m tools.setup build)
 $STD pip3 install --break-system-packages -r "$GHIDRA_MCP_DIR/requirements.txt"
 mkdir -p "$GHIDRA_PROJECT_DIR"
 msg_ok "Built GhidraMCP"
