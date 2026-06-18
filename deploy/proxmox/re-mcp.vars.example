@@ -1,0 +1,54 @@
+# ---------------------------------------------------------------------------
+# re-mcp.vars — App Defaults for the RE-MCP container (community-scripts framework)
+# ---------------------------------------------------------------------------
+# The community-scripts build.func auto-loads per-app defaults from:
+#     /usr/local/community-scripts/defaults/re-mcp.vars      (per-app)
+# and global user defaults from:
+#     /usr/local/community-scripts/default.vars              (all apps)
+#
+# Precedence (build.func): ENV var_* > .vars file > the ct script's built-in
+# var_* defaults. Keys are parsed by a WHITELISTED key=value reader (no eval),
+# so only the var_* names below are honored; unknown keys are ignored.
+#
+# USAGE — pin settings for a NON-INTERACTIVE install (no whiptail prompts):
+#     mkdir -p /usr/local/community-scripts/defaults
+#     cp re-mcp.vars.example /usr/local/community-scripts/defaults/re-mcp.vars
+#     # edit values below, then run ct/re-mcp.sh and pick "App Defaults for RE-MCP"
+#
+# You normally do NOT hand-write this file: run ct/re-mcp.sh once in "Advanced"
+# mode and accept the "save as App Defaults" offer — build.func writes this exact
+# file for you. This template documents the keys and the RE-MCP defaults.
+# ---------------------------------------------------------------------------
+
+# --- OS / type --------------------------------------------------------------
+var_os=debian
+var_version=13
+var_unprivileged=1
+
+# --- resources (Ghidra headless wants ~5G heap; project + JDK + node need disk)
+var_cpu=4
+var_ram=8192
+var_disk=40
+
+# --- network ----------------------------------------------------------------
+var_brg=vmbr0
+var_net=dhcp
+# Pin the container onto a VLAN (802.1q tag) — this is the "keep defaults but on
+# VLAN 50" knob; leave commented for an untagged interface.
+# var_vlan=50
+# var_gateway=10.0.50.1
+# var_mtu=1500
+# var_mac=
+# var_ns=10.0.50.1
+# var_searchdomain=
+
+# --- storage (leave commented to let build.func prompt / auto-pick) ---------
+# var_template_storage=local
+# var_container_storage=local-zfs
+
+# --- misc -------------------------------------------------------------------
+var_tags=mcp;reverse-engineering;ghidra;radare2
+var_ssh=no
+# var_ssh_authorized_key=
+# var_timezone=Europe/Paris
+var_verbose=no
