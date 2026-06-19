@@ -175,6 +175,7 @@ mkdir -p /etc/mcpproxy /var/lib/mcpproxy
 cat >/etc/mcpproxy/mcp_config.json <<EOF
 {
   "listen": "0.0.0.0:${PORT_MCPPROXY}",
+  "call_tool_timeout": "5m0s",
   "mcpServers": [
     { "name": "ghidra", "url": "http://127.0.0.1:8081/mcp", "protocol": "http", "enabled": true },
     { "name": "r2",     "url": "http://127.0.0.1:${R2_MCP_PORT}/mcp", "protocol": "http", "enabled": true },

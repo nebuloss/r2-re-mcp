@@ -36,6 +36,13 @@ export const R2_PROJECT_DIR =
 // closes sessions idle longer than SESSION_IDLE_MIN. Both override-able via env.
 export const MAX_SESSIONS = Math.max(1, parseInt(process.env.R2_MAX_SESSIONS ?? "8", 10));
 export const SESSION_IDLE_MIN = Math.max(1, parseInt(process.env.R2_SESSION_IDLE_MIN ?? "30", 10));
+// Watchdog: a single r2 command may not hold the per-handle mutex longer than
+// this. On expiry the caller gets a clean timeout error and the handle is marked
+// DEAD (the runaway command is still on the pipe, so it can't be safely reused —
+// get()/open() recreate it). Kept BELOW mcpproxy's call_tool_timeout (5m) so a
+// slow call returns a real error to the agent instead of being canceled by the
+// proxy, which would otherwise flip the whole r2 upstream to Error for everyone.
+export const CMD_TIMEOUT_MS = Math.max(5_000, parseInt(process.env.R2_CMD_TIMEOUT_MS ?? "240000", 10));
 
 /**
  * Sanitize a session/target name into an r2-safe PROJECT name.
@@ -55,6 +62,8 @@ export interface R2Handle {
   cmd(command: string): Promise<string>;
   cmdj(command: string): Promise<any>;
   quit(): Promise<void>;
+  /** True once a command exceeded CMD_TIMEOUT_MS — the handle must be discarded. */
+  isDead(): boolean;
 }
 
 interface Session {
@@ -81,11 +90,53 @@ function wrap(raw: any): R2Handle {
   // The mutex tail: a promise that resolves when the last queued op finishes.
   // We chain each new op onto it so writes to the pipe are strictly serialized.
   let chain: Promise<unknown> = Promise.resolve();
+  // Set once a command exceeds CMD_TIMEOUT_MS: the runaway command is still
+  // executing on the single r2 pipe, so NOTHING else may touch it (a second
+  // write would interleave/corrupt). All later ops fail fast; SessionManager
+  // discards the handle and reopens. Best-effort quit is queued so the r2
+  // process exits once its runaway command finally returns.
+  let dead = false;
 
   /** Enqueue `op` behind everything already queued; isolate failures so one
-   *  rejected command does not poison the chain for subsequent commands. */
+   *  rejected command does not poison the chain for subsequent commands.
+   *  Each op is bounded by CMD_TIMEOUT_MS — on expiry the handle is marked dead. */
   function enqueue<T>(op: () => Promise<T>): Promise<T> {
-    const run = chain.then(op, op); // run regardless of prior outcome
+    const guarded = (): Promise<T> => {
+      if (dead) {
+        return Promise.reject(
+          new Error("r2 session was reset (a previous command timed out) — reopen the target")
+        );
+      }
+      return new Promise<T>((resolve, reject) => {
+        let settled = false;
+        const timer = setTimeout(() => {
+          if (settled) return;
+          settled = true;
+          dead = true; // pipe now has a runaway command on it; abandon this handle
+          try {
+            raw.quit(() => undefined); // queues a close for when the runaway returns
+          } catch {
+            /* ignore */
+          }
+          reject(new Error(`r2 command exceeded ${Math.round(CMD_TIMEOUT_MS / 1000)}s — session reset; narrow the query or reopen`));
+        }, CMD_TIMEOUT_MS);
+        op().then(
+          (v) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            resolve(v);
+          },
+          (e) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            reject(e);
+          }
+        );
+      });
+    };
+    const run = chain.then(guarded, guarded); // run regardless of prior outcome
     // Keep the tail alive but swallow rejection so the chain never stays rejected.
     chain = run.then(
       () => undefined,
@@ -130,6 +181,9 @@ function wrap(raw: any): R2Handle {
           })
       );
     },
+    isDead(): boolean {
+      return dead;
+    },
   };
 }
 
@@ -171,6 +225,15 @@ export class SessionManager {
         `target "${name}" is not open. Call open_target({ name: "${name}" }) first.`
       );
     }
+    // A handle whose command timed out is unusable (runaway command still on the
+    // pipe). Drop it so the next open_target recreates a clean r2 (it reloads the
+    // saved project, so analysis/annotations are restored).
+    if (s.handle.isDead()) {
+      void this.close(name).catch(() => undefined); // quits (fast — handle is dead) + removes from map
+      throw new Error(
+        `target "${name}" was reset (a command timed out). Call open_target({ name: "${name}" }) to reopen.`
+      );
+    }
     s.lastUsed = Date.now(); // keep active sessions out of the LRU/idle firing line
     return s.handle;
   }
@@ -205,8 +268,13 @@ export class SessionManager {
     const baseAddr = opts.baseAddr ?? 0;
     const analysis: AnalysisDepth = opts.analysis ?? "basic";
 
-    if (this.sessions.has(name)) {
-      const s = this.sessions.get(name)!;
+    const existing = this.sessions.get(name);
+    if (existing && existing.handle.isDead()) {
+      // Stale (timed-out) session — drop it and fall through to a fresh open.
+      log.warn(`reopening "${name}": prior handle was reset (command timeout)`);
+      await this.close(name).catch(() => undefined);
+    } else if (existing) {
+      const s = existing;
       s.lastUsed = Date.now();
       const funcs = await this.functionCount(s.handle);
       return {
