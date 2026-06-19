@@ -19,6 +19,8 @@ GHIDRA_MCP_DIR=/opt/ghidra-mcp
 GHIDRA_PROJECT_DIR=/opt/ghidra-projects/re
 RE_BINS=/opt/re-bins
 RE_WORK=/opt/re-work
+RE_SRC="${RE_SRC:-/opt/re-src}"
+BRCMFMAC_SRC_REPO="${BRCMFMAC_SRC_REPO:-https://github.com/torvalds/linux}"
 # custom radare2 RE MCP server (THIS repo: github.com/nebuloss/r2-re-mcp)
 R2_RE_MCP_REPO="${R2_RE_MCP_REPO:-https://github.com/nebuloss/r2-re-mcp.git}"
 R2_RE_MCP_DIR="${R2_RE_MCP_DIR:-/opt/r2-re-mcp}"
@@ -35,7 +37,7 @@ $STD apt-get install -y \
   python3 python3-pip python3-venv \
   nodejs npm \
   build-essential pkg-config \
-  binwalk
+  binwalk ripgrep universal-ctags
 msg_ok "Installed Dependencies"
 
 msg_info "Installing Ghidra ${GHIDRA_VERSION}"
@@ -89,12 +91,30 @@ git clone --depth 1 "$R2_RE_MCP_REPO" "$R2_RE_MCP_DIR"
 (cd "$R2_RE_MCP_DIR" && $STD npm install --no-fund --no-audit && $STD npm run build)
 msg_ok "Built r2-re-mcp"
 
+msg_info "Building re-utils-mcp (non-r2: binwalk + source search)"
+RE_UTILS_REPO="${RE_UTILS_REPO:-https://github.com/nebuloss/re-utils-mcp.git}"
+RE_UTILS_DIR="${RE_UTILS_DIR:-/opt/re-utils-mcp}"
+RE_UTILS_OK=0
+git clone --depth 1 "$RE_UTILS_REPO" "$RE_UTILS_DIR" 2>/dev/null || true
+if [ -f "$RE_UTILS_DIR/package.json" ]; then
+  (cd "$RE_UTILS_DIR" && $STD npm install --no-fund --no-audit && $STD npm run build) \
+    && install -m 0644 "$RE_UTILS_DIR/systemd/re-utils-mcp.service" /etc/systemd/system/re-utils-mcp.service \
+    && RE_UTILS_OK=1
+fi
+msg_ok "Built re-utils-mcp"
+
 msg_info "Installing filesystem MCP (server-filesystem; mcpproxy spawns it via stdio)"
 # NO supergateway: it spawned a fresh stdio child per HTTP session and never
 # reaped them (observed 339 leaked node procs / ~4.9G → cgroup OOM). mcpproxy
 # runs mcp-server-filesystem directly as a stdio upstream (one supervised child).
 $STD npm install -g @modelcontextprotocol/server-filesystem
-mkdir -p "$RE_BINS" "$RE_WORK"
+mkdir -p "$RE_BINS" "$RE_WORK" "$RE_SRC"
+# reference open driver source (search_source + filesystem MCP): sparse-checkout
+# just the brcm80211 subtree of mainline (a few MB), for cross-referencing dhd.ko.
+if [ ! -d "$RE_SRC/linux/.git" ]; then
+  git clone --filter=blob:none --no-checkout --depth 1 "$BRCMFMAC_SRC_REPO" "$RE_SRC/linux" >/dev/null 2>&1 || true
+  (cd "$RE_SRC/linux" && git sparse-checkout init --cone && git sparse-checkout set drivers/net/wireless/broadcom/brcm80211 && git checkout) >/dev/null 2>&1 || true
+fi
 msg_ok "Installed filesystem MCP"
 
 msg_info "Creating systemd MCP services"
@@ -180,7 +200,8 @@ cat >/etc/mcpproxy/mcp_config.json <<EOF
   "mcpServers": [
     { "name": "ghidra", "url": "http://127.0.0.1:8081/mcp", "protocol": "http", "enabled": true },
     { "name": "r2",     "url": "http://127.0.0.1:${R2_MCP_PORT}/mcp", "protocol": "http", "enabled": true },
-    { "name": "files",  "command": "/usr/local/bin/mcp-server-filesystem", "args": ["${RE_WORK}", "${RE_BINS}"], "protocol": "stdio", "enabled": true }
+    { "name": "files",  "command": "/usr/local/bin/mcp-server-filesystem", "args": ["${RE_WORK}", "${RE_BINS}", "${RE_SRC}"], "protocol": "stdio", "enabled": true },
+    { "name": "utils",  "url": "http://127.0.0.1:8780/mcp", "protocol": "http", "enabled": true }
   ]
 }
 EOF
@@ -206,7 +227,8 @@ msg_ok "Installed mcpproxy"
 systemctl daemon-reload
 # filesystem-mcp.service intentionally absent — files is a stdio upstream of mcpproxy.
 $STD systemctl enable --now ghidra-headless.service ghidra-mcp.service re-r2-mcp.service mcpproxy.service
-msg_ok "Enabled MCP services (single endpoint :${PORT_MCPPROXY} fronts 8081 ghidra / ${R2_MCP_PORT} re-r2-mcp; files = stdio child)"
+[ "${RE_UTILS_OK:-0}" = 1 ] && $STD systemctl enable --now re-utils-mcp.service
+msg_ok "Enabled MCP services (single endpoint :${PORT_MCPPROXY} fronts ghidra / re-r2-mcp / files / utils)"
 
 # mcpproxy QUARANTINES newly-discovered tools until approved — without this, agents
 # get "TOOL_QUARANTINED / not approved" on a fresh deploy (and when an upstream adds
@@ -219,7 +241,7 @@ for _ in $(seq 1 45); do
   ready="$(curl -fsSL -m 10 "http://127.0.0.1:${PORT_MCPPROXY}/api/v1/servers" -H "X-API-Key: ${APIKEY}" 2>/dev/null | grep -o '"connected":true' | wc -l)"
   [ "${ready:-0}" -ge 3 ] && break; sleep 2
 done
-for s in ghidra r2 files; do
+for s in ghidra r2 files utils; do
   curl -fsSL -m 10 -X POST "http://127.0.0.1:${PORT_MCPPROXY}/api/v1/servers/${s}/tools/approve" \
     -H "X-API-Key: ${APIKEY}" -H 'Content-Type: application/json' -d '{"approve_all":true}' >/dev/null 2>&1 || true
 done

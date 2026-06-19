@@ -29,6 +29,8 @@ R2_RE_MCP_DIR="${R2_RE_MCP_DIR:-/opt/r2-re-mcp}"
 R2_MCP_PORT="${R2_MCP_PORT:-8765}"      # custom server takes the canonical r2-MCP port (stock r2mcp gone)
 RE_BINS="${RE_BINS:-/opt/re-bins}"      # staged firmware/binaries (read by the MCPs)
 RE_WORK="${RE_WORK:-/opt/re-work}"      # scratch / text artifacts (filesystem MCP)
+RE_SRC="${RE_SRC:-/opt/re-src}"         # reference driver source (search_source + filesystem MCP)
+BRCMFMAC_SRC_REPO="${BRCMFMAC_SRC_REPO:-https://github.com/torvalds/linux}"  # mainline; sparse-checkout the brcm80211 subtree only
 RE_TOOLS_RAW="${RE_TOOLS_RAW:-https://raw.githubusercontent.com/nebuloss/r2-re-mcp/main/deploy}"  # for curl|bash use
 PORT_GHIDRA_BACKEND=8089                 # headless REST (loopback only)
 PORT_GHIDRA_MCP=8081                     # bridge (LAN)
@@ -50,7 +52,7 @@ apt-get install -y --no-install-recommends \
     python3 python3-pip python3-venv pipx \
     nodejs npm \
     build-essential pkg-config \
-    binwalk
+    binwalk ripgrep universal-ctags
 
 # ---- 2. Ghidra ------------------------------------------------------------
 if [ ! -x "$GHIDRA_HOME/support/analyzeHeadless" ]; then
@@ -140,13 +142,42 @@ else
 fi
 ( cd "$R2_RE_MCP_DIR" && npm install --no-fund --no-audit && npm run build )
 
+# ---- 4.5 re-utils-mcp (SEPARATE server: non-r2 utilities binwalk + source) -
+# Keeps r2-re-mcp r2-only. mcpproxy fronts it as the "utils" upstream (:8780).
+RE_UTILS_REPO="${RE_UTILS_REPO:-https://github.com/nebuloss/re-utils-mcp.git}"
+RE_UTILS_DIR="${RE_UTILS_DIR:-/opt/re-utils-mcp}"
+RE_UTILS_OK=0
+log "re-utils-mcp (clone + build)"
+if [ ! -d "$RE_UTILS_DIR/.git" ]; then
+  git clone --depth 1 "$RE_UTILS_REPO" "$RE_UTILS_DIR" || echo "  ! re-utils-mcp clone failed (repo missing?) — utils server skipped"
+else
+  git -C "$RE_UTILS_DIR" pull --ff-only || true
+fi
+if [ -f "$RE_UTILS_DIR/package.json" ]; then
+  ( cd "$RE_UTILS_DIR" && npm install --no-fund --no-audit && npm run build ) \
+    && install -m 0644 "$RE_UTILS_DIR/systemd/re-utils-mcp.service" /etc/systemd/system/re-utils-mcp.service \
+    && RE_UTILS_OK=1
+fi
+
 # ---- 5. filesystem MCP (official server; mcpproxy spawns it via stdio) -----
 # NO supergateway: it spawned a fresh stdio child per HTTP session and never
 # reaped them (observed 339 leaked node procs / ~4.9G → cgroup OOM). mcpproxy
 # runs mcp-server-filesystem directly as a stdio upstream (one supervised child).
 log "filesystem MCP (npm global; run as a stdio upstream by mcpproxy, no http bridge)"
 npm install -g @modelcontextprotocol/server-filesystem
-mkdir -p "$RE_BINS" "$RE_WORK"
+mkdir -p "$RE_BINS" "$RE_WORK" "$RE_SRC"
+
+# ---- 5.5 reference open driver source (search_source + filesystem MCP) -----
+# Sparse-checkout just the brcm80211 subtree of mainline (a few MB, not the whole
+# kernel) so agents can cross-reference dhd.ko / firmware against the open driver.
+log "reference driver source -> ${RE_SRC}/linux (sparse brcm80211)"
+if [ ! -d "$RE_SRC/linux/.git" ]; then
+  git clone --filter=blob:none --no-checkout --depth 1 "$BRCMFMAC_SRC_REPO" "$RE_SRC/linux" || true
+  ( cd "$RE_SRC/linux" \
+    && git sparse-checkout init --cone \
+    && git sparse-checkout set drivers/net/wireless/broadcom/brcm80211 \
+    && git checkout ) || echo "  ! source sparse-checkout failed (drop source into ${RE_SRC} manually)"
+fi
 
 # ---- 6. systemd services --------------------------------------------------
 log "systemd units"
@@ -237,7 +268,8 @@ cat > /etc/mcpproxy/mcp_config.json <<EOF
   "mcpServers": [
     { "name": "ghidra", "url": "http://127.0.0.1:${PORT_GHIDRA_MCP}/mcp", "protocol": "http", "enabled": true },
     { "name": "r2",     "url": "http://127.0.0.1:${PORT_R2MCP}/mcp", "protocol": "http", "enabled": true },
-    { "name": "files",  "command": "/usr/local/bin/mcp-server-filesystem", "args": ["${RE_WORK}", "${RE_BINS}"], "protocol": "stdio", "enabled": true }
+    { "name": "files",  "command": "/usr/local/bin/mcp-server-filesystem", "args": ["${RE_WORK}", "${RE_BINS}", "${RE_SRC}"], "protocol": "stdio", "enabled": true },
+    { "name": "utils",  "url": "http://127.0.0.1:8780/mcp", "protocol": "http", "enabled": true }
   ]
 }
 EOF
@@ -262,6 +294,7 @@ EOF
 systemctl daemon-reload
 # NOTE: filesystem-mcp.service intentionally removed — files is a stdio upstream of mcpproxy.
 systemctl enable --now ghidra-headless.service ghidra-mcp.service re-r2-mcp.service mcpproxy.service
+[ "${RE_UTILS_OK:-0}" = 1 ] && systemctl enable --now re-utils-mcp.service
 
 # ---- mcpproxy: auto-approve our trusted upstream tools --------------------
 # mcpproxy QUARANTINES newly-discovered tools ("TOOL_QUARANTINED — must be
@@ -283,7 +316,7 @@ for _ in $(seq 1 45); do
            | grep -o '"connected":true' | wc -l)"
   [ "${ready:-0}" -ge 3 ] && break; sleep 2
 done
-for s in ghidra r2 files; do
+for s in ghidra r2 files utils; do
   resp="$(curl -fsSL -m 10 -X POST "http://127.0.0.1:${PORT_MCPPROXY}/api/v1/servers/${s}/tools/approve" \
     -H "X-API-Key: ${APIKEY}" -H 'Content-Type: application/json' -d '{"approve_all":true}' 2>/dev/null || true)"
   echo "  ${s}: ${resp}"
