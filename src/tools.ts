@@ -34,6 +34,7 @@ import { registerSymbolTools } from "./tools/symbols.js";
 import { registerTypeTools } from "./tools/types.js";
 import { registerDiffTools } from "./tools/diff.js";
 import { registerSignatureTools } from "./tools/signatures.js";
+import { registerFirmwareTools } from "./tools/firmware.js";
 
 /**
  * Probe which decompiler commands are available in this r2 build, in order of
@@ -520,4 +521,5 @@ export function registerTools(server: McpServer, sm: SessionManager): void {
   registerTypeTools(server, sm);
   registerDiffTools(server, sm);
   registerSignatureTools(server, sm);
+  registerFirmwareTools(server, sm);
 }

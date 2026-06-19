@@ -34,7 +34,8 @@ $STD apt-get install -y \
   openjdk-21-jdk maven \
   python3 python3-pip python3-venv \
   nodejs npm \
-  build-essential pkg-config
+  build-essential pkg-config \
+  binwalk
 msg_ok "Installed Dependencies"
 
 msg_info "Installing Ghidra ${GHIDRA_VERSION}"

@@ -49,7 +49,8 @@ apt-get install -y --no-install-recommends \
     openjdk-21-jdk maven \
     python3 python3-pip python3-venv pipx \
     nodejs npm \
-    build-essential pkg-config
+    build-essential pkg-config \
+    binwalk
 
 # ---- 2. Ghidra ------------------------------------------------------------
 if [ ! -x "$GHIDRA_HOME/support/analyzeHeadless" ]; then
