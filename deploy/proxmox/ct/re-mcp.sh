@@ -44,7 +44,7 @@ function update_script() {
   if [[ -d /opt/r2-re-mcp/.git ]]; then
     cd /opt/r2-re-mcp && git pull --ff-only 2>/dev/null && npm install --no-fund --no-audit && npm run build || true
   fi
-  systemctl restart ghidra-headless ghidra-mcp re-r2-mcp filesystem-mcp mcpproxy
+  systemctl restart ghidra-headless ghidra-mcp re-r2-mcp mcpproxy
   msg_ok "Updated ${APP}"
   exit
 }
@@ -58,7 +58,7 @@ echo -e "${CREATING}${GN}${APP} setup has been successfully initialized!${CL}"
 echo -e "${INFO}${YW} SINGLE aggregated MCP endpoint — front THIS one with a TLS subdomain; register ONLY it (type=http):${CL}"
 echo -e "${TAB}${GATEWAY}${BGN}mcpproxy  http://${IP}:8090/mcp/   <-- the only endpoint clients use${CL}"
 echo -e "${INFO}${YW} Backends behind it (loopback; not registered directly — add/remove in /etc/mcpproxy/mcp_config.json):${CL}"
-echo -e "${TAB}${GATEWAY}${BGN}ghidra    http://127.0.0.1:8081/mcp${CL}"
-echo -e "${TAB}${GATEWAY}${BGN}re-r2-mcp http://127.0.0.1:8765/mcp  (custom r2-re-mcp server)${CL}"
-echo -e "${TAB}${GATEWAY}${BGN}files     http://127.0.0.1:8082/mcp${CL}"
+echo -e "${TAB}${GATEWAY}${BGN}ghidra    http://127.0.0.1:8081/mcp  (loopback)${CL}"
+echo -e "${TAB}${GATEWAY}${BGN}re-r2-mcp http://127.0.0.1:8765/mcp  (loopback; custom r2-re-mcp server)${CL}"
+echo -e "${TAB}${GATEWAY}${BGN}files     stdio child of mcpproxy (mcp-server-filesystem) — no port${CL}"
 echo -e "${INFO}${YW} Stage binaries into /opt/re-bins (scp/mount); then write ingest.manifest + run ingest-re-bins.sh.${CL}"

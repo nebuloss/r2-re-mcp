@@ -30,6 +30,13 @@ export const RE_BINS = process.env.RE_BINS ?? "/opt/re-bins";
 export const R2_PROJECT_DIR =
   process.env.R2_PROJECT_DIR ?? path.join(RE_BINS, ".r2projects");
 
+// Each open target holds a live r2 process + its analysis in RAM. Under PARALLEL
+// agents that pile up fast, so bound them: opening past MAX_SESSIONS evicts the
+// least-recently-used session (best-effort project save first), and startReaper()
+// closes sessions idle longer than SESSION_IDLE_MIN. Both override-able via env.
+export const MAX_SESSIONS = Math.max(1, parseInt(process.env.R2_MAX_SESSIONS ?? "8", 10));
+export const SESSION_IDLE_MIN = Math.max(1, parseInt(process.env.R2_SESSION_IDLE_MIN ?? "30", 10));
+
 /**
  * Sanitize a session/target name into an r2-safe PROJECT name.
  *
@@ -57,6 +64,7 @@ interface Session {
   bits: number;
   baseAddr: number;
   handle: R2Handle;
+  lastUsed: number; // epoch ms; bumped on every get()/open() for LRU + idle reaping
 }
 
 /**
@@ -163,6 +171,7 @@ export class SessionManager {
         `target "${name}" is not open. Call open_target({ name: "${name}" }) first.`
       );
     }
+    s.lastUsed = Date.now(); // keep active sessions out of the LRU/idle firing line
     return s.handle;
   }
 
@@ -198,6 +207,7 @@ export class SessionManager {
 
     if (this.sessions.has(name)) {
       const s = this.sessions.get(name)!;
+      s.lastUsed = Date.now();
       const funcs = await this.functionCount(s.handle);
       return {
         name: s.name,
@@ -219,6 +229,9 @@ export class SessionManager {
         `binary not found: ${filePath} (RE_BINS=${RE_BINS}). Stage it on the container first.`
       );
     }
+
+    // Bound concurrent sessions BEFORE opening another r2 process.
+    await this.evictLruIfNeeded();
 
     // r2pipe.open flags: raw arch/bits + map base. The blob loads at baseAddr
     // (0 for ram.shift.bin, so r2-addr == firmware-VA). -b is bits, -a is arch,
@@ -277,7 +290,7 @@ export class SessionManager {
       }
     }
 
-    const session: Session = { name, filePath, arch, bits, baseAddr, handle };
+    const session: Session = { name, filePath, arch, bits, baseAddr, handle, lastUsed: Date.now() };
     this.sessions.set(name, session);
 
     const functions = await this.functionCount(handle);
@@ -324,6 +337,53 @@ export class SessionManager {
       log.warn(`save project ${name} failed: ${msg}`);
       return { ok: false, where, note: msg };
     }
+  }
+
+  /**
+   * If at the session cap, evict the least-recently-used session to make room.
+   * Best-effort project save first so accumulated analysis survives the close
+   * (reopen auto-loads the project). Never throws — eviction must not block open.
+   */
+  private async evictLruIfNeeded(): Promise<void> {
+    while (this.sessions.size >= MAX_SESSIONS) {
+      let lru: Session | undefined;
+      for (const s of this.sessions.values()) {
+        if (!lru || s.lastUsed < lru.lastUsed) lru = s;
+      }
+      if (!lru) return;
+      log.warn(
+        `session cap (${MAX_SESSIONS}) reached — evicting LRU "${lru.name}" (idle ${Math.round(
+          (Date.now() - lru.lastUsed) / 1000
+        )}s)`
+      );
+      try {
+        await this.saveProject(lru.name);
+      } catch (e) {
+        log.warn(`evict: project save for ${lru.name} failed: ${errMsg(e)}`);
+      }
+      await this.close(lru.name);
+    }
+  }
+
+  /**
+   * Periodically close sessions idle longer than SESSION_IDLE_MIN (best-effort
+   * project save first). Returns the interval handle (unref'd so it never keeps
+   * the process alive). Wired once at startup in server.ts.
+   */
+  startReaper(idleMin = SESSION_IDLE_MIN, sweepMs = 60_000): NodeJS.Timeout {
+    const idleMs = idleMin * 60_000;
+    const t = setInterval(() => {
+      const now = Date.now();
+      const stale = [...this.sessions.values()].filter((s) => now - s.lastUsed > idleMs);
+      for (const s of stale) {
+        log.info(`reaping idle session "${s.name}" (idle ${Math.round((now - s.lastUsed) / 60_000)}m)`);
+        this.saveProject(s.name)
+          .catch((e) => log.warn(`reaper: save ${s.name} failed: ${errMsg(e)}`))
+          .finally(() => void this.close(s.name));
+      }
+    }, sweepMs);
+    t.unref?.();
+    return t;
   }
 
   async close(name: string): Promise<boolean> {

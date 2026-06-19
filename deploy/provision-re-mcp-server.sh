@@ -6,7 +6,7 @@
 #
 #   * Ghidra (headless) + GhidraMCP   -> HTTP MCP on :8081  (decompile/analysis)
 #   * radare2 + r2-re-mcp (custom)    -> HTTP MCP on :8765  (disasm/search)
-#   * @modelcontextprotocol filesystem + supergateway -> HTTP MCP on :8082
+#   * @modelcontextprotocol filesystem -> stdio upstream spawned by mcpproxy (no port)
 #
 # Spirit of the Proxmox VE Helper-Scripts: run as root inside a clean container.
 # Idempotent-ish (safe to re-run). TLS/subdomains are handled by an EXTERNAL
@@ -33,7 +33,7 @@ RE_TOOLS_RAW="${RE_TOOLS_RAW:-https://raw.githubusercontent.com/nebuloss/r2-re-m
 PORT_GHIDRA_BACKEND=8089                 # headless REST (loopback only)
 PORT_GHIDRA_MCP=8081                     # bridge (LAN)
 PORT_R2MCP="$R2_MCP_PORT"                # custom r2-re-mcp server
-PORT_FS_MCP=8082
+# PORT_FS_MCP removed — filesystem is a stdio child of mcpproxy (no listening port)
 MCPPROXY_VERSION="${MCPPROXY_VERSION:-0.40.0}"   # smart-mcp-proxy/mcpproxy-go (single aggregated endpoint)
 PORT_MCPPROXY="${PORT_MCPPROXY:-8090}"           # the SINGLE MCP interface this LXC exposes
 log(){ echo -e "\n\033[1;32m== $* ==\033[0m"; }
@@ -139,9 +139,12 @@ else
 fi
 ( cd "$R2_RE_MCP_DIR" && npm install --no-fund --no-audit && npm run build )
 
-# ---- 5. filesystem MCP (official server + supergateway) -------------------
-log "filesystem MCP (npm globals)"
-npm install -g @modelcontextprotocol/server-filesystem supergateway
+# ---- 5. filesystem MCP (official server; mcpproxy spawns it via stdio) -----
+# NO supergateway: it spawned a fresh stdio child per HTTP session and never
+# reaped them (observed 339 leaked node procs / ~4.9G → cgroup OOM). mcpproxy
+# runs mcp-server-filesystem directly as a stdio upstream (one supervised child).
+log "filesystem MCP (npm global; run as a stdio upstream by mcpproxy, no http bridge)"
+npm install -g @modelcontextprotocol/server-filesystem
 mkdir -p "$RE_BINS" "$RE_WORK"
 
 # ---- 6. systemd services --------------------------------------------------
@@ -170,6 +173,10 @@ ExecStart=/usr/bin/bash ${GHIDRA_MCP_DIR}/docker/entrypoint.sh
 Restart=on-failure
 RestartSec=5
 TimeoutStartSec=300
+# Blast-radius guard: cap above the -Xmx5g heap so a Ghidra runaway is OOM'd in
+# ITS OWN cgroup instead of taking down the whole container (and every agent).
+MemoryHigh=5632M
+MemoryMax=6G
 [Install]
 WantedBy=multi-user.target
 EOF
@@ -185,10 +192,11 @@ Type=simple
 WorkingDirectory=${GHIDRA_MCP_DIR}
 Environment=GHIDRA_MCP_URL=http://127.0.0.1:${PORT_GHIDRA_BACKEND}
 ExecStartPre=/bin/sh -c 'for i in \$(seq 1 120); do curl -sf -o /dev/null http://127.0.0.1:${PORT_GHIDRA_BACKEND}/check_connection && exit 0; sleep 1; done; exit 1'
-ExecStart=/usr/bin/python3 ${GHIDRA_MCP_DIR}/bridge_mcp_ghidra.py --transport streamable-http --mcp-host 0.0.0.0 --mcp-port ${PORT_GHIDRA_MCP}
+ExecStart=/usr/bin/python3 ${GHIDRA_MCP_DIR}/bridge_mcp_ghidra.py --transport streamable-http --mcp-host 127.0.0.1 --mcp-port ${PORT_GHIDRA_MCP}
 Restart=on-failure
 RestartSec=5
 TimeoutStartSec=180
+MemoryMax=1G
 [Install]
 WantedBy=multi-user.target
 EOF
@@ -204,19 +212,9 @@ sed -i \
   -e "s#^ExecStart=.*#ExecStart=/usr/bin/node ${R2_RE_MCP_DIR}/dist/server.js#" \
   /etc/systemd/system/re-r2-mcp.service
 
-cat > /etc/systemd/system/filesystem-mcp.service <<EOF
-[Unit]
-Description=Filesystem MCP (official server-filesystem via supergateway, streamable-http :${PORT_FS_MCP})
-After=network.target
-[Service]
-Type=simple
-Environment=HOME=/root
-ExecStart=/usr/local/bin/supergateway --stdio "mcp-server-filesystem ${RE_WORK} ${RE_BINS}" --outputTransport streamableHttp --port ${PORT_FS_MCP}
-Restart=on-failure
-RestartSec=5
-[Install]
-WantedBy=multi-user.target
-EOF
+# NOTE: no filesystem-mcp.service — the filesystem server is launched by mcpproxy
+# itself as a stdio upstream (see the "files" entry in mcp_config.json below), so
+# there is no long-lived http bridge and no per-session child leak.
 
 # ---- mcpproxy: the SINGLE aggregated MCP endpoint this LXC exposes ---------
 # smart-mcp-proxy/mcpproxy-go — one binary, no DB; transparently fronts all the
@@ -237,7 +235,7 @@ cat > /etc/mcpproxy/mcp_config.json <<EOF
   "mcpServers": [
     { "name": "ghidra", "url": "http://127.0.0.1:${PORT_GHIDRA_MCP}/mcp", "protocol": "http", "enabled": true },
     { "name": "r2",     "url": "http://127.0.0.1:${PORT_R2MCP}/mcp", "protocol": "http", "enabled": true },
-    { "name": "files",  "url": "http://127.0.0.1:${PORT_FS_MCP}/mcp", "protocol": "http", "enabled": true }
+    { "name": "files",  "command": "/usr/local/bin/mcp-server-filesystem", "args": ["${RE_WORK}", "${RE_BINS}"], "protocol": "stdio", "enabled": true }
   ]
 }
 EOF
@@ -253,12 +251,15 @@ Environment=HOME=/root
 ExecStart=/usr/local/bin/mcpproxy serve -c /etc/mcpproxy/mcp_config.json -d /var/lib/mcpproxy -l 0.0.0.0:${PORT_MCPPROXY} --log-level info
 Restart=on-failure
 RestartSec=5
+# Bounds mcpproxy AND the filesystem stdio child it spawns (same cgroup).
+MemoryMax=2G
 [Install]
 WantedBy=multi-user.target
 EOF
 
 systemctl daemon-reload
-systemctl enable --now ghidra-headless.service ghidra-mcp.service re-r2-mcp.service filesystem-mcp.service mcpproxy.service
+# NOTE: filesystem-mcp.service intentionally removed — files is a stdio upstream of mcpproxy.
+systemctl enable --now ghidra-headless.service ghidra-mcp.service re-r2-mcp.service mcpproxy.service
 
 # ---- 6.5 ingest helper (persistent, correct-base project import) ----------
 # Programs load transiently otherwise (lost on restart). Stage the helper next
@@ -278,7 +279,7 @@ fi
 # ---- 7. report ------------------------------------------------------------
 log "status"
 sleep 5
-for s in ghidra-headless ghidra-mcp re-r2-mcp filesystem-mcp mcpproxy; do
+for s in ghidra-headless ghidra-mcp re-r2-mcp mcpproxy; do
   printf "%-18s %s\n" "$s" "$(systemctl is-active $s)"
 done
 echo
@@ -290,7 +291,7 @@ echo
 echo "Backends behind it (loopback; not registered in clients directly):"
 echo "  ghidra    -> http://127.0.0.1:${PORT_GHIDRA_MCP}/mcp"
 echo "  re-r2-mcp -> http://127.0.0.1:${PORT_R2MCP}/mcp  (custom r2-re-mcp server)"
-echo "  files     -> http://127.0.0.1:${PORT_FS_MCP}/mcp  (scoped: ${RE_WORK}, ${RE_BINS})"
+echo "  files     -> stdio child of mcpproxy (mcp-server-filesystem; scoped: ${RE_WORK}, ${RE_BINS}) — no port"
 echo
 echo "Stage binaries into ${RE_BINS} (scp or a mount) — do NOT push multi-MB blobs through MCP."
 echo

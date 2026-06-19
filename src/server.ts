@@ -14,6 +14,8 @@
  *
  * Env:
  *   R2_MCP_PORT     listen port (default 8766)
+ *   R2_MCP_HOST     bind address (default 127.0.0.1 — loopback-only so only the
+ *                   local mcpproxy aggregator can reach it; set 0.0.0.0 to expose)
  *   RE_BINS         staged binaries dir (default /opt/re-bins)
  *   R2_PROJECT_DIR  r2 project dir (default $RE_BINS/.r2projects)
  *   LOG_LEVEL       error|warn|info|debug (default info)
@@ -28,7 +30,9 @@ import { registerTools } from "./tools.js";
 import { log } from "./util.js";
 
 const PORT = parseInt(process.env.R2_MCP_PORT ?? "8766", 10);
-const HOST = "0.0.0.0";
+// Loopback by default: this server sits behind the local mcpproxy aggregator,
+// which is the only public endpoint. Override with R2_MCP_HOST=0.0.0.0 if needed.
+const HOST = process.env.R2_MCP_HOST ?? "127.0.0.1";
 const MCP_PATH = "/mcp";
 
 const sessions = new SessionManager();
@@ -154,6 +158,10 @@ async function shutdown(signal: string) {
 }
 process.on("SIGINT", () => void shutdown("SIGINT"));
 process.on("SIGTERM", () => void shutdown("SIGTERM"));
+
+// Reap idle r2 sessions so abandoned targets don't accumulate processes/RAM
+// under parallel agents (the session cap handles the hard ceiling at open()).
+sessions.startReaper();
 
 httpServer.listen(PORT, HOST, () => {
   log.info(`r2-re-mcp listening on http://${HOST}:${PORT}${MCP_PATH}`);

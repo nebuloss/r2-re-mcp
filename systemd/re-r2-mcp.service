@@ -24,6 +24,10 @@ Environment=LOG_LEVEL=info
 ExecStart=/usr/bin/node /opt/r2-re-mcp/dist/server.js
 Restart=on-failure
 RestartSec=5
+# Blast-radius guard: a runaway r2 session pile-up is OOM'd in this cgroup,
+# not the whole container. TasksMax bounds spawned r2 child processes.
+MemoryMax=3G
+TasksMax=512
 
 [Install]
 WantedBy=multi-user.target

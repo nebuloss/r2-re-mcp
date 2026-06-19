@@ -88,8 +88,11 @@ git clone --depth 1 "$R2_RE_MCP_REPO" "$R2_RE_MCP_DIR"
 (cd "$R2_RE_MCP_DIR" && $STD npm install --no-fund --no-audit && $STD npm run build)
 msg_ok "Built r2-re-mcp"
 
-msg_info "Installing filesystem MCP (server-filesystem + supergateway)"
-$STD npm install -g @modelcontextprotocol/server-filesystem supergateway
+msg_info "Installing filesystem MCP (server-filesystem; mcpproxy spawns it via stdio)"
+# NO supergateway: it spawned a fresh stdio child per HTTP session and never
+# reaped them (observed 339 leaked node procs / ~4.9G → cgroup OOM). mcpproxy
+# runs mcp-server-filesystem directly as a stdio upstream (one supervised child).
+$STD npm install -g @modelcontextprotocol/server-filesystem
 mkdir -p "$RE_BINS" "$RE_WORK"
 msg_ok "Installed filesystem MCP"
 
@@ -116,6 +119,10 @@ ExecStart=/usr/bin/bash ${GHIDRA_MCP_DIR}/docker/entrypoint.sh
 Restart=on-failure
 RestartSec=5
 TimeoutStartSec=300
+# Blast-radius guard: cap above the -Xmx5g heap so a Ghidra runaway is OOM'd in
+# ITS OWN cgroup instead of taking down the whole container (and every agent).
+MemoryHigh=5632M
+MemoryMax=6G
 [Install]
 WantedBy=multi-user.target
 EOF
@@ -130,10 +137,11 @@ Type=simple
 WorkingDirectory=${GHIDRA_MCP_DIR}
 Environment=GHIDRA_MCP_URL=http://127.0.0.1:8089
 ExecStartPre=/bin/sh -c 'for i in \$(seq 1 120); do curl -sf -o /dev/null http://127.0.0.1:8089/check_connection && exit 0; sleep 1; done; exit 1'
-ExecStart=/usr/bin/python3 ${GHIDRA_MCP_DIR}/bridge_mcp_ghidra.py --transport streamable-http --mcp-host 0.0.0.0 --mcp-port 8081
+ExecStart=/usr/bin/python3 ${GHIDRA_MCP_DIR}/bridge_mcp_ghidra.py --transport streamable-http --mcp-host 127.0.0.1 --mcp-port 8081
 Restart=on-failure
 RestartSec=5
 TimeoutStartSec=180
+MemoryMax=1G
 [Install]
 WantedBy=multi-user.target
 EOF
@@ -147,20 +155,10 @@ sed -i \
   -e "s#^Environment=RE_BINS=.*#Environment=RE_BINS=${RE_BINS}#" \
   -e "s#^ExecStart=.*#ExecStart=/usr/bin/node ${R2_RE_MCP_DIR}/dist/server.js#" \
   /etc/systemd/system/re-r2-mcp.service
-cat >/etc/systemd/system/filesystem-mcp.service <<EOF
-[Unit]
-Description=Filesystem MCP (server-filesystem via supergateway, streamable-http :8082)
-After=network.target
-[Service]
-Type=simple
-Environment=HOME=/root
-ExecStart=/usr/local/bin/supergateway --stdio "mcp-server-filesystem ${RE_WORK} ${RE_BINS}" --outputTransport streamableHttp --port 8082
-Restart=on-failure
-RestartSec=5
-[Install]
-WantedBy=multi-user.target
-EOF
-msg_ok "Created systemd MCP services (8081 ghidra / ${R2_MCP_PORT} re-r2-mcp / 8082 files)"
+# NOTE: no filesystem-mcp.service — the filesystem server is launched by mcpproxy
+# itself as a stdio upstream (see the "files" entry in mcp_config.json below), so
+# there is no long-lived http bridge and no per-session child leak.
+msg_ok "Created systemd MCP services (8081 ghidra / ${R2_MCP_PORT} re-r2-mcp; files = mcpproxy stdio child)"
 
 msg_info "Installing mcpproxy (single aggregated MCP endpoint :${PORT_MCPPROXY})"
 # smart-mcp-proxy/mcpproxy-go — one binary, no DB; transparently fronts all the
@@ -180,7 +178,7 @@ cat >/etc/mcpproxy/mcp_config.json <<EOF
   "mcpServers": [
     { "name": "ghidra", "url": "http://127.0.0.1:8081/mcp", "protocol": "http", "enabled": true },
     { "name": "r2",     "url": "http://127.0.0.1:${R2_MCP_PORT}/mcp", "protocol": "http", "enabled": true },
-    { "name": "files",  "url": "http://127.0.0.1:8082/mcp", "protocol": "http", "enabled": true }
+    { "name": "files",  "command": "/usr/local/bin/mcp-server-filesystem", "args": ["${RE_WORK}", "${RE_BINS}"], "protocol": "stdio", "enabled": true }
   ]
 }
 EOF
@@ -196,14 +194,17 @@ Environment=HOME=/root
 ExecStart=/usr/local/bin/mcpproxy serve -c /etc/mcpproxy/mcp_config.json -d /var/lib/mcpproxy -l 0.0.0.0:${PORT_MCPPROXY} --log-level info
 Restart=on-failure
 RestartSec=5
+# Bounds mcpproxy AND the filesystem stdio child it spawns (same cgroup).
+MemoryMax=2G
 [Install]
 WantedBy=multi-user.target
 EOF
 msg_ok "Installed mcpproxy"
 
 systemctl daemon-reload
-$STD systemctl enable --now ghidra-headless.service ghidra-mcp.service re-r2-mcp.service filesystem-mcp.service mcpproxy.service
-msg_ok "Enabled MCP services (single endpoint :${PORT_MCPPROXY} fronts 8081 ghidra / ${R2_MCP_PORT} re-r2-mcp / 8082 files)"
+# filesystem-mcp.service intentionally absent — files is a stdio upstream of mcpproxy.
+$STD systemctl enable --now ghidra-headless.service ghidra-mcp.service re-r2-mcp.service mcpproxy.service
+msg_ok "Enabled MCP services (single endpoint :${PORT_MCPPROXY} fronts 8081 ghidra / ${R2_MCP_PORT} re-r2-mcp; files = stdio child)"
 
 msg_info "Installing ingest helper (persistent, correct-base project import)"
 if curl -fsSL "${RE_TOOLS_RAW}/ingest-re-bins.sh" -o "${GHIDRA_MCP_DIR}/ingest-re-bins.sh" 2>/dev/null; then
