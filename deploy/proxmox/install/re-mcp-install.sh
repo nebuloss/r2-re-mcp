@@ -207,6 +207,23 @@ systemctl daemon-reload
 $STD systemctl enable --now ghidra-headless.service ghidra-mcp.service re-r2-mcp.service mcpproxy.service
 msg_ok "Enabled MCP services (single endpoint :${PORT_MCPPROXY} fronts 8081 ghidra / ${R2_MCP_PORT} re-r2-mcp; files = stdio child)"
 
+# mcpproxy QUARANTINES newly-discovered tools until approved — without this, agents
+# get "TOOL_QUARANTINED / not approved" on a fresh deploy (and when an upstream adds
+# tools). These are our own trusted servers; approve them once discovered. (api_key
+# is written into the config by mcpproxy on first start; tools appear a few sec later.)
+msg_info "Approving mcpproxy upstream tools"
+APIKEY=""
+for _ in $(seq 1 30); do APIKEY="$(jq -r '.api_key // empty' /etc/mcpproxy/mcp_config.json 2>/dev/null)"; [ -n "$APIKEY" ] && break; sleep 2; done
+for _ in $(seq 1 45); do
+  ready="$(curl -fsSL -m 10 "http://127.0.0.1:${PORT_MCPPROXY}/api/v1/servers" -H "X-API-Key: ${APIKEY}" 2>/dev/null | grep -o '"connected":true' | wc -l)"
+  [ "${ready:-0}" -ge 3 ] && break; sleep 2
+done
+for s in ghidra r2 files; do
+  curl -fsSL -m 10 -X POST "http://127.0.0.1:${PORT_MCPPROXY}/api/v1/servers/${s}/tools/approve" \
+    -H "X-API-Key: ${APIKEY}" -H 'Content-Type: application/json' -d '{"approve_all":true}' >/dev/null 2>&1 || true
+done
+msg_ok "Approved mcpproxy upstream tools"
+
 msg_info "Installing ingest helper (persistent, correct-base project import)"
 if curl -fsSL "${RE_TOOLS_RAW}/ingest-re-bins.sh" -o "${GHIDRA_MCP_DIR}/ingest-re-bins.sh" 2>/dev/null; then
   chmod +x "${GHIDRA_MCP_DIR}/ingest-re-bins.sh"
