@@ -36,6 +36,10 @@ PORT_GHIDRA_BACKEND=8089                 # headless REST (loopback only)
 PORT_GHIDRA_MCP=8081                     # bridge (LAN)
 PORT_R2MCP="$R2_MCP_PORT"                # custom r2-re-mcp server
 # PORT_FS_MCP removed — filesystem is a stdio child of mcpproxy (no listening port)
+# Dynamic-analysis upstream: re-dyn-mcp runs on dev-build (gdb + QEMU harness),
+# NOT this container — point mcpproxy at it over the lab net. Inert until the
+# QEMU harness is up (GDB=1); harmless if dev-build is unreachable (mcpproxy retries).
+DYN_MCP_URL="${DYN_MCP_URL:-http://10.0.50.21:8781/mcp}"
 MCPPROXY_VERSION="${MCPPROXY_VERSION:-0.40.0}"   # smart-mcp-proxy/mcpproxy-go (single aggregated endpoint)
 PORT_MCPPROXY="${PORT_MCPPROXY:-8090}"           # the SINGLE MCP interface this LXC exposes
 log(){ echo -e "\n\033[1;32m== $* ==\033[0m"; }
@@ -269,7 +273,8 @@ cat > /etc/mcpproxy/mcp_config.json <<EOF
     { "name": "ghidra", "url": "http://127.0.0.1:${PORT_GHIDRA_MCP}/mcp", "protocol": "http", "enabled": true },
     { "name": "r2",     "url": "http://127.0.0.1:${PORT_R2MCP}/mcp", "protocol": "http", "enabled": true },
     { "name": "files",  "command": "/usr/local/bin/mcp-server-filesystem", "args": ["${RE_WORK}", "${RE_BINS}", "${RE_SRC}"], "protocol": "stdio", "enabled": true },
-    { "name": "utils",  "url": "http://127.0.0.1:8780/mcp", "protocol": "http", "enabled": true }
+    { "name": "utils",  "url": "http://127.0.0.1:8780/mcp", "protocol": "http", "enabled": true },
+    { "name": "dyn",    "url": "${DYN_MCP_URL}", "protocol": "http", "enabled": true }
   ]
 }
 EOF
@@ -316,7 +321,7 @@ for _ in $(seq 1 45); do
            | grep -o '"connected":true' | wc -l)"
   [ "${ready:-0}" -ge 3 ] && break; sleep 2
 done
-for s in ghidra r2 files utils; do
+for s in ghidra r2 files utils dyn; do
   resp="$(curl -fsSL -m 10 -X POST "http://127.0.0.1:${PORT_MCPPROXY}/api/v1/servers/${s}/tools/approve" \
     -H "X-API-Key: ${APIKEY}" -H 'Content-Type: application/json' -d '{"approve_all":true}' 2>/dev/null || true)"
   echo "  ${s}: ${resp}"
