@@ -97,6 +97,36 @@ function wrap(raw: any): R2Handle {
   // process exits once its runaway command finally returns.
   let dead = false;
 
+  // Per-session read cache. Expensive, analysis-STABLE listings (function list,
+  // strings, sections, symbols, info) cost ~700ms each (e.g. aflj on a 2MB libc)
+  // and are recomputed on every call — under parallel agents they serialize on
+  // the mutex and dominate tail latency. We cache their results and, critically,
+  // FLUSH the whole cache on ANY command that is not a known pure read (analyze,
+  // rename `afn`, comment `CC`, type defs, writes, ...). Over-flushing is safe
+  // (just a miss); under-flushing is not — so the pure-read set is kept tight.
+  const readCache = new Map<string, any>();
+  // In-flight dedup: collapses a stampede of concurrent identical cacheable
+  // commands (N agents calling aflj on the same binary at once) into ONE r2
+  // computation — the rest await the same promise instead of each queuing a
+  // 700ms scan on the mutex.
+  const inflight = new Map<string, Promise<any>>();
+  // Bumped on every flush. A read computation that started before a mutation
+  // must NOT populate the cache afterwards (it holds pre-mutation data), and a
+  // post-flush caller must not join a pre-flush in-flight computation — both are
+  // gated on the generation captured when the computation began.
+  let gen = 0;
+  const CACHEABLE = /^\s*(aflj|aflt|afij\b|izzj?|iSj?|isj?|ij)\b/;
+  const PURE_READ =
+    /^\s*(aflj|aflt|afl|afij\b|afbj?\b|afi|izzj?|iSj?|isj?|ij|i$|pd|pi|px|p8|ps|ag|axtj?|axfj?|s |s$|\?|e )/;
+  const cacheKey = (c: string, j: boolean) => (j ? "j:" : "c:") + c.trim();
+  function maybeFlush(command: string): void {
+    if (!PURE_READ.test(command)) {
+      readCache.clear();
+      inflight.clear(); // new callers start fresh; in-flight results are dropped on store via gen
+      gen++;
+    }
+  }
+
   /** Enqueue `op` behind everything already queued; isolate failures so one
    *  rejected command does not poison the chain for subsequent commands.
    *  Each op is bounded by CMD_TIMEOUT_MS — on expiry the handle is marked dead. */
@@ -163,10 +193,55 @@ function wrap(raw: any): R2Handle {
 
   return {
     cmd(command: string): Promise<string> {
-      return enqueue(() => rawCmd(command));
+      maybeFlush(command); // invalidate cache if this command can mutate analysis
+      if (!CACHEABLE.test(command)) return enqueue(() => rawCmd(command));
+      const key = cacheKey(command, false);
+      if (readCache.has(key)) return Promise.resolve(readCache.get(key)); // hit: instant, skips the mutex
+      if (inflight.has(key)) return inflight.get(key)!; // join the in-flight computation
+      const g = gen;
+      const p = enqueue(() => rawCmd(command)).then(
+        (res) => {
+          if (g === gen) readCache.set(key, res); // skip if a flush happened mid-flight (stale)
+          if (inflight.get(key) === p) inflight.delete(key);
+          return res;
+        },
+        (e) => {
+          if (inflight.get(key) === p) inflight.delete(key);
+          throw e;
+        }
+      );
+      inflight.set(key, p);
+      return p;
     },
     cmdj(command: string): Promise<any> {
-      return enqueue(() => rawCmdj(command));
+      maybeFlush(command);
+      // cmdj returns objects/arrays callers may mutate in place (sort/slice), so
+      // store a pristine clone and hand out clones — the cache never aliases.
+      const clone = (v: any) => {
+        try {
+          return structuredClone(v);
+        } catch {
+          return v === undefined ? v : JSON.parse(JSON.stringify(v));
+        }
+      };
+      if (!CACHEABLE.test(command)) return enqueue(() => rawCmdj(command));
+      const key = cacheKey(command, true);
+      if (readCache.has(key)) return Promise.resolve(clone(readCache.get(key)));
+      if (inflight.has(key)) return inflight.get(key)!.then(clone); // join in-flight, own clone
+      const g = gen;
+      const p = enqueue(() => rawCmdj(command)).then(
+        (res) => {
+          if (g === gen) readCache.set(key, clone(res)); // skip if a flush happened mid-flight (stale)
+          if (inflight.get(key) === p) inflight.delete(key);
+          return res;
+        },
+        (e) => {
+          if (inflight.get(key) === p) inflight.delete(key);
+          throw e;
+        }
+      );
+      inflight.set(key, p);
+      return p.then(clone);
     },
     quit(): Promise<void> {
       // Drain in-flight/queued commands first, then close the pipe.
