@@ -25,7 +25,6 @@ BRCMFMAC_SRC_REPO="${BRCMFMAC_SRC_REPO:-https://github.com/torvalds/linux}"
 R2_RE_MCP_REPO="${R2_RE_MCP_REPO:-https://github.com/nebuloss/r2-re-mcp.git}"
 R2_RE_MCP_DIR="${R2_RE_MCP_DIR:-/opt/r2-re-mcp}"
 R2_MCP_PORT="${R2_MCP_PORT:-8765}"      # custom server takes the canonical r2-MCP port (stock r2mcp gone)
-DYN_MCP_URL="${DYN_MCP_URL:-http://10.0.50.21:8781/mcp}"  # re-dyn-mcp on dev-build (gdb vs QEMU harness)
 MCPPROXY_VERSION="${MCPPROXY_VERSION:-0.40.0}"   # smart-mcp-proxy/mcpproxy-go (single aggregated endpoint)
 PORT_MCPPROXY="${PORT_MCPPROXY:-8090}"           # the SINGLE MCP interface this LXC exposes
 # raw base for this repo's deploy/ helpers (override if you fork/rename or change branch)
@@ -202,8 +201,8 @@ cat >/etc/mcpproxy/mcp_config.json <<EOF
     { "name": "ghidra", "url": "http://127.0.0.1:8081/mcp", "protocol": "http", "enabled": true },
     { "name": "r2",     "url": "http://127.0.0.1:${R2_MCP_PORT}/mcp", "protocol": "http", "enabled": true },
     { "name": "files",  "command": "/usr/local/bin/mcp-server-filesystem", "args": ["${RE_WORK}", "${RE_BINS}", "${RE_SRC}"], "protocol": "stdio", "enabled": true },
-    { "name": "utils",  "url": "http://127.0.0.1:8780/mcp", "protocol": "http", "enabled": true },
-    { "name": "dyn",    "url": "${DYN_MCP_URL}", "protocol": "http", "enabled": true }
+    { "name": "utils",  "url": "http://127.0.0.1:8780/mcp", "protocol": "http", "enabled": true }
+
   ]
 }
 EOF
@@ -243,7 +242,7 @@ for _ in $(seq 1 45); do
   ready="$(curl -fsSL -m 10 "http://127.0.0.1:${PORT_MCPPROXY}/api/v1/servers" -H "X-API-Key: ${APIKEY}" 2>/dev/null | grep -o '"connected":true' | wc -l)"
   [ "${ready:-0}" -ge 3 ] && break; sleep 2
 done
-for s in ghidra r2 files utils dyn; do
+for s in ghidra r2 files utils; do
   curl -fsSL -m 10 -X POST "http://127.0.0.1:${PORT_MCPPROXY}/api/v1/servers/${s}/tools/approve" \
     -H "X-API-Key: ${APIKEY}" -H 'Content-Type: application/json' -d '{"approve_all":true}' >/dev/null 2>&1 || true
 done
