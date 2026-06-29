@@ -123,22 +123,39 @@ fi
 msg_ok "Installed filesystem MCP"
 
 msg_info "Creating systemd MCP services"
-# Helper run as ghidra-headless ExecStartPost: once the REST backend is up, open
-# the configured default program from the (already-analyzed) project so a
-# *current program* exists. Uses the headless /load_program_from_project path
-# (no re-analysis); best-effort so a load hiccup never fails/kills the backend.
+# Helper run as ghidra-headless ExecStartPost: once the REST backend is up,
+# PRE-OPEN every ingested project program (derived from the ingest manifest) and
+# pin GHIDRA_DEFAULT_PROGRAM as the current one. This means (1) a current program
+# always exists after a (re)start, and (2) every binary is instantly addressable
+# per-call via the `program=<name>` parameter (178/192 tools accept it) — so
+# parallel agents target different programs WITHOUT switching a shared current.
+# Uses the headless /load_program_from_project path (no re-analysis); best-effort
+# so a load hiccup never fails/kills the backend.
 cat >/usr/local/bin/ghidra-load-default-program <<'HLP'
 #!/bin/sh
-prog="${GHIDRA_DEFAULT_PROGRAM:-}"
 port="${GHIDRA_MCP_PORT:-8089}"
-[ -z "$prog" ] && exit 0
-for i in $(seq 1 150); do
-  curl -sf -o /dev/null "http://127.0.0.1:${port}/check_connection" && break
-  sleep 1
+base="http://127.0.0.1:${port}"
+manifest="${GHIDRA_INGEST_MANIFEST:-/opt/re-bins/ingest.manifest}"
+# Program list: explicit env wins; else derive from the ingest manifest (col 1 =
+# imported file basename -> project path "/<name>"). Self-maintaining.
+progs="${GHIDRA_OPEN_PROGRAMS:-}"
+if [ -z "$progs" ] && [ -f "$manifest" ]; then
+  progs=$(awk '!/^[[:space:]]*#/ && NF {printf "/%s ", $1}' "$manifest")
+fi
+[ -z "$progs" ] && exit 0
+i=0; while [ "$i" -lt 150 ]; do
+  curl -sf -o /dev/null "$base/check_connection" && break
+  i=$((i+1)); sleep 1
 done
-curl -sf -X POST "http://127.0.0.1:${port}/load_program_from_project" \
-     -H 'Content-Type: application/json' \
-     -d "{\"path\":\"${prog}\"}" >/dev/null 2>&1 || true
+default="${GHIDRA_DEFAULT_PROGRAM:-}"
+[ -z "$default" ] && default=$(echo "$progs" | awk '{print $1}')
+for p in $progs; do
+  [ -z "$p" ] && continue
+  curl -sf -X POST "$base/load_program_from_project" -H 'Content-Type: application/json' \
+       -d "{\"path\":\"$p\"}" >/dev/null 2>&1 || true
+done
+name=$(echo "$default" | sed 's#^/##')
+[ -n "$name" ] && curl -sf -o /dev/null "$base/switch_program?program=${name}" 2>/dev/null || true
 exit 0
 HLP
 chmod +x /usr/local/bin/ghidra-load-default-program
@@ -158,7 +175,8 @@ Environment=GHIDRA_MCP_BIND_ADDRESS=127.0.0.1
 # Backend binds loopback only; exposure is via the bridge on the lab subnet.
 Environment=GHIDRA_MCP_ALLOW_SCRIPTS=1
 Environment=PROJECT_PATH=${GHIDRA_PROJECT_DIR}
-# Auto-load this project program as *current* after start (see helper above).
+# Pre-open all ingested programs; pin this one as *current* (see helper above).
+# Override the open-set with GHIDRA_OPEN_PROGRAMS="/a /b"; else manifest-derived.
 Environment=GHIDRA_DEFAULT_PROGRAM=${GHIDRA_DEFAULT_PROGRAM}
 Environment="JAVA_OPTS=-Xmx5g -XX:+UseG1GC"
 # Launch via the repo's entrypoint (builds Ghidra classpath, runs GhidraMCPHeadlessServer);
