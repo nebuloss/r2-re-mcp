@@ -17,6 +17,11 @@ GHIDRA_MCP_REPO="${GHIDRA_MCP_REPO:-https://github.com/bethington/ghidra-mcp.git
 GHIDRA_HOME=/opt/ghidra
 GHIDRA_MCP_DIR=/opt/ghidra-mcp
 GHIDRA_PROJECT_DIR=/opt/ghidra-projects/re
+# Project-relative path of the program auto-loaded as the *current program* on
+# every backend (re)start (backend opens the project but selects no program on
+# its own; without this the bridge tools return "No program loaded" after a
+# restart/reboot). Empty string disables.
+GHIDRA_DEFAULT_PROGRAM="${GHIDRA_DEFAULT_PROGRAM:-/ram.shift.bin}"
 RE_BINS=/opt/re-bins
 RE_WORK=/opt/re-work
 RE_SRC="${RE_SRC:-/opt/re-src}"
@@ -118,6 +123,26 @@ fi
 msg_ok "Installed filesystem MCP"
 
 msg_info "Creating systemd MCP services"
+# Helper run as ghidra-headless ExecStartPost: once the REST backend is up, open
+# the configured default program from the (already-analyzed) project so a
+# *current program* exists. Uses the headless /load_program_from_project path
+# (no re-analysis); best-effort so a load hiccup never fails/kills the backend.
+cat >/usr/local/bin/ghidra-load-default-program <<'HLP'
+#!/bin/sh
+prog="${GHIDRA_DEFAULT_PROGRAM:-}"
+port="${GHIDRA_MCP_PORT:-8089}"
+[ -z "$prog" ] && exit 0
+for i in $(seq 1 150); do
+  curl -sf -o /dev/null "http://127.0.0.1:${port}/check_connection" && break
+  sleep 1
+done
+curl -sf -X POST "http://127.0.0.1:${port}/load_program_from_project" \
+     -H 'Content-Type: application/json' \
+     -d "{\"path\":\"${prog}\"}" >/dev/null 2>&1 || true
+exit 0
+HLP
+chmod +x /usr/local/bin/ghidra-load-default-program
+
 cat >/etc/systemd/system/ghidra-headless.service <<EOF
 [Unit]
 Description=Ghidra MCP Headless Server (REST backend 127.0.0.1:8089)
@@ -133,10 +158,16 @@ Environment=GHIDRA_MCP_BIND_ADDRESS=127.0.0.1
 # Backend binds loopback only; exposure is via the bridge on the lab subnet.
 Environment=GHIDRA_MCP_ALLOW_SCRIPTS=1
 Environment=PROJECT_PATH=${GHIDRA_PROJECT_DIR}
+# Auto-load this project program as *current* after start (see helper above).
+Environment=GHIDRA_DEFAULT_PROGRAM=${GHIDRA_DEFAULT_PROGRAM}
 Environment="JAVA_OPTS=-Xmx5g -XX:+UseG1GC"
 # Launch via the repo's entrypoint (builds Ghidra classpath, runs GhidraMCPHeadlessServer);
 # reads GHIDRA_HOME/GHIDRA_MCP_PORT/GHIDRA_MCP_BIND_ADDRESS/PROJECT_PATH; jar at /app/GhidraMCP.jar.
 ExecStart=/usr/bin/bash ${GHIDRA_MCP_DIR}/docker/entrypoint.sh
+# After the backend is up, select a current program so the bridge's analysis
+# tools work immediately (and survive reboots). Runs in the unit's env, so it
+# sees GHIDRA_DEFAULT_PROGRAM/GHIDRA_MCP_PORT above.
+ExecStartPost=/usr/local/bin/ghidra-load-default-program
 Restart=on-failure
 RestartSec=5
 TimeoutStartSec=300
