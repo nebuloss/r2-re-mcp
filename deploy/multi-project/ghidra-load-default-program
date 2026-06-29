@@ -1,0 +1,49 @@
+#!/bin/sh
+# Pre-open the ingested project programs into the headless backend so that:
+#   1. a *current program* always exists after a (re)start (no "No program
+#      loaded"), and
+#   2. EVERY ingested binary is immediately addressable per-call via the
+#      `program=<name>` parameter (most tools accept it) — so parallel RE
+#      agents target different binaries WITHOUT switching a shared current.
+# Runtime /import_file + /open_program need GUI mode (absent in this headless
+# build); /load_program_from_project loads an already-analyzed program from the
+# project with NO re-analysis. Best-effort: NEVER fail the unit (always exit 0)
+# so a load hiccup can't leave the MCP backend down.
+#
+# Per-instance-env aware (used by both the static unit and the ghidra-headless@
+# template instances): honours GHIDRA_MCP_PORT, GHIDRA_INGEST_MANIFEST,
+# GHIDRA_DEFAULT_PROGRAM and GHIDRA_OPEN_PROGRAMS from the unit's environment.
+port="${GHIDRA_MCP_PORT:-8089}"
+base="http://127.0.0.1:${port}"
+manifest="${GHIDRA_INGEST_MANIFEST:-/opt/re-bins/ingest.manifest}"
+
+# Program list: explicit env wins; otherwise derive from the ingest manifest
+# (col 1 = imported file basename -> project path "/<name>"). Self-maintaining:
+# add a binary to the manifest + re-ingest and it auto-opens on next restart.
+progs="${GHIDRA_OPEN_PROGRAMS:-}"
+if [ -z "$progs" ] && [ -f "$manifest" ]; then
+  progs=$(awk '!/^[[:space:]]*#/ && NF {printf "/%s ", $1}' "$manifest")
+fi
+[ -z "$progs" ] && exit 0
+
+# Wait for the REST backend to accept connections (mirrors the bridge's wait).
+i=0; while [ "$i" -lt 150 ]; do
+  curl -sf -o /dev/null "$base/check_connection" && break
+  i=$((i+1)); sleep 1
+done
+
+# Default current program (env, with or without leading slash); else the first.
+default="${GHIDRA_DEFAULT_PROGRAM:-}"
+[ -z "$default" ] && default=$(echo "$progs" | awk '{print $1}')
+
+# Open every program (idempotent; no re-analysis).
+for p in $progs; do
+  [ -z "$p" ] && continue
+  curl -sf -X POST "$base/load_program_from_project" -H 'Content-Type: application/json' \
+       -d "{\"path\":\"$p\"}" >/dev/null 2>&1 || true
+done
+
+# Force the default to be the current program (switch takes a bare name).
+name=$(echo "$default" | sed 's#^/##')
+[ -n "$name" ] && curl -sf -o /dev/null "$base/switch_program?program=${name}" 2>/dev/null || true
+exit 0

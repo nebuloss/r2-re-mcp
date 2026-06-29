@@ -285,6 +285,26 @@ MemoryMax=1G
 WantedBy=multi-user.target
 EOF
 
+# ---- 6.1 multi-project mechanism (template units + ghidra-project CLI) -----
+# ADDITIVE: lets this host run SEVERAL INDEPENDENT Ghidra projects at once. The
+# headless backend opens exactly ONE project and has no runtime project-switch,
+# so each project = its own backend + bridge + mcpproxy upstream (ghidra-<name>).
+# The static ghidra-headless/ghidra-mcp units + `ghidra` upstream above remain
+# the default "re" project, untouched. Template instances reuse the same
+# manifest-driven /usr/local/bin/ghidra-load-default-program helper installed
+# above. Canonical sources live in deploy/multi-project/ of this repo.
+log "multi-project template units + ghidra-project CLI"
+mkdir -p /etc/ghidra-projects
+_mp_self="$(cd "$(dirname "$0")" 2>/dev/null && pwd || true)"
+_mp_src="${_mp_self}/multi-project"
+_stage_mp(){ # $1=filename  $2=dest  $3=mode
+  if [ -f "${_mp_src}/$1" ]; then install -m "$3" "${_mp_src}/$1" "$2"
+  else curl -fsSL "${RE_TOOLS_RAW}/multi-project/$1" -o "$2" && chmod "$3" "$2"; fi
+}
+_stage_mp 'ghidra-headless@.service' /etc/systemd/system/ghidra-headless@.service 0644
+_stage_mp 'ghidra-mcp@.service'      /etc/systemd/system/ghidra-mcp@.service      0644
+_stage_mp 'ghidra-project'           /usr/local/bin/ghidra-project                0755
+
 # Install the repo's own systemd unit for the custom server, then repoint its
 # WorkingDirectory/ExecStart at $R2_RE_MCP_DIR and its port to $R2_MCP_PORT
 # (the shipped unit hardcodes /opt/r2-re-mcp + 8766).

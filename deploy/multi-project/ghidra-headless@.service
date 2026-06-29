@@ -1,0 +1,29 @@
+[Unit]
+# Per-project headless Ghidra MCP REST backend (templated instance %i).
+# One instance == one independent Ghidra PROJECT. The headless backend opens
+# exactly ONE project (--project) and has no runtime project-switching, so true
+# multi-PROJECT support = one backend (+ bridge + mcpproxy upstream) per project.
+# All knobs come from /etc/ghidra-projects/%i.env (written by `ghidra-project`):
+#   PROJECT_PATH, GHIDRA_HOME, GHIDRA_MCP_PORT, GHIDRA_MCP_BIND_ADDRESS,
+#   GHIDRA_MCP_ALLOW_SCRIPTS, GHIDRA_DEFAULT_PROGRAM, GHIDRA_INGEST_MANIFEST,
+#   JAVA_OPTS.  Loopback-only bind; mcpproxy fronts it as upstream ghidra-%i.
+Description=Ghidra MCP Headless Server (project %i)
+After=network.target
+[Service]
+Type=simple
+WorkingDirectory=/opt/ghidra-mcp
+EnvironmentFile=/etc/ghidra-projects/%i.env
+# entrypoint.sh reads GHIDRA_HOME/GHIDRA_MCP_PORT/GHIDRA_MCP_BIND_ADDRESS/
+# PROJECT_PATH/JAVA_OPTS from the EnvironmentFile above; jar at /app/GhidraMCP.jar.
+ExecStart=/usr/bin/bash /opt/ghidra-mcp/docker/entrypoint.sh
+# After the backend is up: pre-open every program in this project's manifest and
+# pin GHIDRA_DEFAULT_PROGRAM as current (manifest-driven, per-instance-env aware).
+ExecStartPost=/usr/local/bin/ghidra-load-default-program
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=300
+# Per-instance blast-radius guard. Real heap is ~300-500M despite the -Xmx3g
+# ceiling in JAVA_OPTS; cap above it so a runaway is OOM'd in its OWN cgroup.
+MemoryMax=3500M
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,21 @@
+[Unit]
+# Per-project streamable-http bridge (templated instance %i) for the headless
+# backend of the same project. Binds 127.0.0.1:${BRIDGE_PORT}; mcpproxy fronts it
+# as upstream ghidra-%i. GHIDRA_MCP_URL + BRIDGE_PORT come from the EnvironmentFile.
+Description=Ghidra MCP Bridge (project %i)
+After=network.target ghidra-headless@%i.service
+Requires=ghidra-headless@%i.service
+PartOf=ghidra-headless@%i.service
+[Service]
+Type=simple
+WorkingDirectory=/opt/ghidra-mcp
+EnvironmentFile=/etc/ghidra-projects/%i.env
+# Wait for this project's backend (GHIDRA_MCP_URL) before starting the bridge.
+ExecStartPre=/bin/sh -c 'for _ in $(seq 1 120); do curl -sf -o /dev/null "${GHIDRA_MCP_URL}/check_connection" && exit 0; sleep 1; done; exit 1'
+ExecStart=/usr/bin/python3 /opt/ghidra-mcp/bridge_mcp_ghidra.py --transport streamable-http --mcp-host 127.0.0.1 --mcp-port ${BRIDGE_PORT}
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=180
+MemoryMax=1G
+[Install]
+WantedBy=multi-user.target

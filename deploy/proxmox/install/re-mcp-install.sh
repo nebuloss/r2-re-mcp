@@ -230,6 +230,22 @@ sed -i \
 # there is no long-lived http bridge and no per-session child leak.
 msg_ok "Created systemd MCP services (8081 ghidra / ${R2_MCP_PORT} re-r2-mcp; files = mcpproxy stdio child)"
 
+msg_info "Installing multi-project mechanism (template units + ghidra-project CLI)"
+# ADDITIVE: lets this host run SEVERAL INDEPENDENT Ghidra projects at once. Each
+# project = its own backend+bridge+mcpproxy upstream (ghidra-<name>); the static
+# ghidra-headless/ghidra-mcp units + `ghidra` upstream above stay the default
+# "re" project. Template instances reuse the manifest-driven load helper above.
+# Canonical sources: deploy/multi-project/ of this repo (RE_TOOLS_RAW/multi-project).
+mkdir -p /etc/ghidra-projects
+for f in "ghidra-headless@.service" "ghidra-mcp@.service"; do
+  curl -fsSL "${RE_TOOLS_RAW}/multi-project/${f}" -o "/etc/systemd/system/${f}" 2>/dev/null \
+    || msg_info "Could not fetch ${f} (set RE_TOOLS_RAW); copy deploy/multi-project/${f} manually"
+done
+if curl -fsSL "${RE_TOOLS_RAW}/multi-project/ghidra-project" -o /usr/local/bin/ghidra-project 2>/dev/null; then
+  chmod +x /usr/local/bin/ghidra-project
+fi
+msg_ok "Installed multi-project mechanism (ghidra-project add|list|rm)"
+
 msg_info "Installing mcpproxy (single aggregated MCP endpoint :${PORT_MCPPROXY})"
 # smart-mcp-proxy/mcpproxy-go — one binary, no DB; transparently fronts all the
 # local MCP servers behind ONE endpoint. Add/remove a backend = edit this config

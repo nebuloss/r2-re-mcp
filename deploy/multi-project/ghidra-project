@@ -1,0 +1,254 @@
+#!/usr/bin/env bash
+# ghidra-project — manage MULTIPLE INDEPENDENT headless Ghidra MCP projects.
+# ---------------------------------------------------------------------------
+# The headless GhidraMCP backend opens exactly ONE project and has no runtime
+# project-switching, so each independent PROJECT needs its own backend + bridge
+# + mcpproxy upstream. This CLI orchestrates that lifecycle via the systemd
+# template units ghidra-headless@<name> / ghidra-mcp@<name> and per-project
+# EnvironmentFiles under /etc/ghidra-projects/<name>.env.
+#
+# Each project is fronted by mcpproxy as a SEPARATE upstream `ghidra-<name>`
+# (its own tool namespace). Agents "switch projects" by addressing the matching
+# upstream; within a project, every tool takes a per-call program=<name> param.
+#
+#   ghidra-project add  <name> [--bins f1,f2,..|--manifest PATH]
+#                              [--lang ID] [--base ADDR] [--loader L] [--default P]
+#   ghidra-project list
+#   ghidra-project rm   <name> [--purge]
+# ---------------------------------------------------------------------------
+set -euo pipefail
+
+# ---- config (override via env) --------------------------------------------
+ETC_DIR="${GHIDRA_PROJECTS_ETC:-/etc/ghidra-projects}"
+PROJ_ROOT="${GHIDRA_PROJECTS_ROOT:-/opt/ghidra-projects}"
+GHIDRA_HOME="${GHIDRA_HOME:-/opt/ghidra}"
+HEADLESS="$GHIDRA_HOME/support/analyzeHeadless"
+RE_BINS="${RE_BINS:-/opt/re-bins}"
+MCP_CONFIG="${MCP_CONFIG:-/etc/mcpproxy/mcp_config.json}"
+MCPPROXY="${MCPPROXY_BIN:-/usr/local/bin/mcpproxy}"
+MCPPROXY_DATA_DIR="${MCPPROXY_DATA_DIR:-/var/lib/mcpproxy}"
+BACKEND_BASE="${GHIDRA_BACKEND_PORT_BASE:-8100}"   # backend ports: 8100,8101,...
+BRIDGE_BASE="${GHIDRA_BRIDGE_PORT_BASE:-8200}"     # bridge  ports: 8200,8201,...
+CAP="${GHIDRA_PROJECT_CAP:-3}"                     # max concurrent projects (RAM)
+JAVA_OPTS_DEFAULT="${GHIDRA_PROJECT_JAVA_OPTS:--Xmx3g -XX:+UseG1GC}"
+export HOME="${HOME:-/root}"                        # mcpproxy CLI needs HOME
+
+die(){ echo "ghidra-project: $*" >&2; exit 1; }
+log(){ echo -e "\033[1;32m== $* ==\033[0m"; }
+
+[ "$(id -u)" = 0 ] || die "must run as root"
+
+# mcpproxy upstream ops always target the running daemon's data-dir (so they
+# hot-reload it AND persist to MCP_CONFIG). Quiet wrapper.
+mp(){ "$MCPPROXY" upstream "$@" -c "$MCP_CONFIG" -d "$MCPPROXY_DATA_DIR"; }
+
+mcpproxy_listen_port(){ jq -r '.listen // "0.0.0.0:8090"' "$MCP_CONFIG" 2>/dev/null | sed 's/.*://'; }
+mcpproxy_apikey(){ jq -r '.api_key // empty' "$MCP_CONFIG" 2>/dev/null; }
+
+valid_name(){ printf '%s' "$1" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9_-]*$'; }
+
+# indices already taken by existing project env files (idx = backend - base)
+used_indices(){
+  local f p
+  for f in "$ETC_DIR"/*.env; do
+    [ -e "$f" ] || continue
+    p="$(sed -n 's/^GHIDRA_MCP_PORT=//p' "$f" | head -1)"
+    [ -n "$p" ] && echo $(( p - BACKEND_BASE ))
+  done
+}
+project_count(){ local c=0 f; for f in "$ETC_DIR"/*.env; do [ -e "$f" ] && c=$((c+1)); done; echo "$c"; }
+alloc_index(){
+  local taken i; taken=" $(used_indices | tr '\n' ' ' || true) "
+  for i in $(seq 0 99); do
+    case "$taken" in *" $i "*) : ;; *) echo "$i"; return 0;; esac
+  done
+  die "no free port slot"
+}
+
+# ---- add ------------------------------------------------------------------
+cmd_add(){
+  local name="" bins="" manifest="" lang="" base="-" loader="BinaryLoader" default=""
+  name="${1:?usage: ghidra-project add <name> [--bins ..|--manifest PATH] [--lang ID] [--base ADDR] [--loader L] [--default P]}"; shift || true
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --bins) bins="$2"; shift 2;;
+      --manifest) manifest="$2"; shift 2;;
+      --lang) lang="$2"; shift 2;;
+      --base) base="$2"; shift 2;;
+      --loader) loader="$2"; shift 2;;
+      --default) default="$2"; shift 2;;
+      *) die "unknown flag: $1";;
+    esac
+  done
+
+  valid_name "$name" || die "invalid project name '$name' (use [A-Za-z0-9_-])"
+  [ "$name" = "re" ] && die "'re' is the legacy static project (ghidra upstream); pick another name"
+  local envf="$ETC_DIR/$name.env"
+  [ -e "$envf" ] && die "project '$name' already exists ($envf) — rm it first"
+  local n; n="$(project_count)"
+  [ "$n" -ge "$CAP" ] && die "active project cap reached ($n/$CAP); raise GHIDRA_PROJECT_CAP or 'ghidra-project rm' one"
+  [ -x "$HEADLESS" ] || die "analyzeHeadless not found at $HEADLESS"
+
+  mkdir -p "$ETC_DIR" "$PROJ_ROOT"
+  local projdir="$PROJ_ROOT/$name"
+  mkdir -p "$projdir"
+  local manf="$projdir/ingest.manifest"
+
+  # Build / stage the per-project ingest manifest (cols: FILE LANG BASE LOADER).
+  if [ -n "$manifest" ]; then
+    [ -f "$manifest" ] || die "--manifest $manifest not found"
+    cp -f "$manifest" "$manf"
+  elif [ -n "$bins" ]; then
+    [ -n "$lang" ] || die "--bins requires --lang (processor id, e.g. x86:LE:64:default)"
+    : > "$manf"
+    local IFS=','; local b
+    for b in $bins; do
+      [ -n "$b" ] || continue
+      printf '%s %s %s %s\n' "$b" "$lang" "$base" "$loader" >> "$manf"
+    done
+    unset IFS
+  else
+    die "provide --bins f1,f2,.. (with --lang) or --manifest PATH"
+  fi
+
+  # Default current program: explicit --default, else first manifest file.
+  if [ -z "$default" ]; then
+    default="$(awk '!/^[[:space:]]*#/ && NF {print $1; exit}' "$manf")"
+  fi
+  default="${default#/}"
+
+  local idx bport rport
+  idx="$(alloc_index)"; bport=$(( BACKEND_BASE + idx )); rport=$(( BRIDGE_BASE + idx ))
+
+  # ---- ingest binaries into the project (persistent, analyzed, saved) -------
+  # Fresh project, no backend yet -> no lock contention. analyzeHeadless writes
+  # <projdir>/<name>.gpr; the backend opens that single *.gpr via --project.
+  log "ingest into project '$name' ($projdir)"
+  local file flang fbase floader src args
+  while read -r file flang fbase floader _rest; do
+    [ -n "${file:-}" ] || continue
+    case "$file" in \#*) continue;; esac
+    floader="${floader:-BinaryLoader}"
+    src="$RE_BINS/$file"
+    [ -f "$src" ] || { echo "  ! missing $src (skip)"; continue; }
+    args=( "$projdir" "$name" -import "$src" -overwrite -processor "$flang" -loader "$floader" )
+    if [ "${fbase:-}" != "-" ] && [ -n "${fbase:-}" ]; then args+=( -loader-baseAddr "$fbase" ); fi
+    echo "  -> $file ($flang @ ${fbase:--})"
+    "$HEADLESS" "${args[@]}" >/dev/null 2>&1 || echo "  ! ingest FAILED for $file"
+  done < "$manf"
+
+  # ---- write the per-project EnvironmentFile --------------------------------
+  cat > "$envf" <<EOF
+# /etc/ghidra-projects/$name.env — generated by ghidra-project ($(date -u +%FT%TZ))
+PROJECT_PATH=$projdir
+GHIDRA_HOME=$GHIDRA_HOME
+GHIDRA_MCP_PORT=$bport
+GHIDRA_MCP_BIND_ADDRESS=127.0.0.1
+GHIDRA_MCP_ALLOW_SCRIPTS=1
+BRIDGE_PORT=$rport
+GHIDRA_MCP_URL=http://127.0.0.1:$bport
+GHIDRA_DEFAULT_PROGRAM=/$default
+GHIDRA_INGEST_MANIFEST=$manf
+JAVA_OPTS=$JAVA_OPTS_DEFAULT
+EOF
+
+  log "start services (backend :$bport, bridge :$rport)"
+  systemctl enable --now "ghidra-headless@$name" "ghidra-mcp@$name"
+
+  log "register mcpproxy upstream ghidra-$name -> http://127.0.0.1:$rport/mcp"
+  register_proxy "$name" "$rport"
+
+  echo
+  echo "project '$name' ready:"
+  echo "  backend  127.0.0.1:$bport   bridge 127.0.0.1:$rport"
+  echo "  upstream ghidra-$name (mcpproxy)   env $envf"
+  echo "  call e.g.: mcpproxy call tool-read --tool-name=ghidra-$name:list_open_programs --json_args={} -c $MCP_CONFIG"
+}
+
+# Register (or re-register) the bridge as mcpproxy upstream ghidra-<name>,
+# wait for it to connect, then approve its tools. Idempotent.
+register_proxy(){
+  local name="$1" rport="$2" up="ghidra-$1"
+  mp remove "$up" --yes --if-exists >/dev/null 2>&1 || true
+  mp add "$up" "http://127.0.0.1:$rport/mcp" --transport http --no-quarantine --if-not-exists >/dev/null
+  local ak port i conn approved napp total zeros
+  ak="$(mcpproxy_apikey)"; port="$(mcpproxy_listen_port)"
+  # Wait for the running daemon to connect to this upstream and index its tools.
+  for i in $(seq 1 30); do
+    conn="$(curl -fsS -m 8 "http://127.0.0.1:$port/api/v1/servers" -H "X-API-Key: $ak" 2>/dev/null \
+            | jq -r --arg n "$up" '.data.servers[]|select(.name==$n)|.connected' 2>/dev/null || true)"
+    [ "$conn" = "true" ] && break; sleep 2
+  done
+  # mcpproxy QUARANTINES newly-discovered tools until approved (else agents get
+  # TOOL_QUARANTINED instead of results). approve_all only approves tools indexed
+  # SO FAR, and the ~220 tools index incrementally after connect — so loop until
+  # two consecutive passes approve nothing (all caught up). Mirrors the deploy
+  # scripts' approve path; idempotent.
+  total=0; zeros=0
+  for i in $(seq 1 24); do
+    approved="$(curl -fsS -m 10 -X POST "http://127.0.0.1:$port/api/v1/servers/$up/tools/approve" \
+      -H "X-API-Key: $ak" -H 'Content-Type: application/json' -d '{"approve_all":true}' 2>/dev/null || true)"
+    napp="$(printf '%s' "$approved" | jq -r '.data.approved // 0' 2>/dev/null || echo 0)"
+    total=$(( total + ${napp:-0} ))
+    if [ "${napp:-0}" -eq 0 ]; then zeros=$(( zeros + 1 )); else zeros=0; fi
+    [ "$total" -gt 0 ] && [ "$zeros" -ge 2 ] && break
+    sleep 2
+  done
+  echo "  upstream ghidra-$name connected=$conn tools_approved=$total"
+}
+
+# ---- list -----------------------------------------------------------------
+cmd_list(){
+  local f name bport rport bstat rstat progs cur
+  [ -n "$(ls -A "$ETC_DIR"/*.env 2>/dev/null || true)" ] || { echo "(no template projects)"; return 0; }
+  printf '%-16s %-8s %-8s %-10s %-10s %s\n' PROJECT BACKEND BRIDGE HEADLESS BRIDGESVC "OPEN PROGRAMS (current*)"
+  for f in "$ETC_DIR"/*.env; do
+    [ -e "$f" ] || continue
+    name="$(basename "$f" .env)"
+    bport="$(sed -n 's/^GHIDRA_MCP_PORT=//p' "$f" | head -1)"
+    rport="$(sed -n 's/^BRIDGE_PORT=//p' "$f" | head -1)"
+    bstat="$(systemctl is-active "ghidra-headless@$name" 2>/dev/null || true)"
+    rstat="$(systemctl is-active "ghidra-mcp@$name" 2>/dev/null || true)"
+    progs="$(curl -fsS -m 5 "http://127.0.0.1:$bport/list_open_programs" 2>/dev/null | tr -d '\r' | paste -sd, - 2>/dev/null || true)"
+    printf '%-16s %-8s %-8s %-10s %-10s %s\n' "$name" "$bport" "$rport" "$bstat" "$rstat" "${progs:--}"
+  done
+}
+
+# ---- rm -------------------------------------------------------------------
+cmd_rm(){
+  local name="${1:?usage: ghidra-project rm <name> [--purge]}"; shift || true
+  local purge=0
+  [ "${1:-}" = "--purge" ] && purge=1
+  local envf="$ETC_DIR/$name.env"
+  [ -e "$envf" ] || die "no such project '$name' ($envf)"
+  log "stop + disable ghidra-headless@$name / ghidra-mcp@$name"
+  systemctl disable --now "ghidra-mcp@$name" "ghidra-headless@$name" >/dev/null 2>&1 || true
+  systemctl reset-failed "ghidra-mcp@$name" "ghidra-headless@$name" >/dev/null 2>&1 || true
+  log "deregister mcpproxy upstream ghidra-$name"
+  mp remove "ghidra-$name" --yes --if-exists >/dev/null 2>&1 || true
+  rm -f "$envf"
+  # clear any stale project lock
+  rm -f "$PROJ_ROOT/$name"/*.lock "$PROJ_ROOT/$name"/*.lock~ 2>/dev/null || true
+  if [ "$purge" = 1 ]; then
+    log "purge project data $PROJ_ROOT/$name"
+    rm -rf "${PROJ_ROOT:?}/$name"
+  else
+    echo "  (project data left on disk at $PROJ_ROOT/$name; use --purge to delete)"
+  fi
+  echo "removed '$name'"
+}
+
+# ---- dispatch -------------------------------------------------------------
+case "${1:-}" in
+  add)  shift; cmd_add "$@";;
+  list) shift; cmd_list "$@";;
+  rm)   shift; cmd_rm "$@";;
+  *) cat >&2 <<USG
+ghidra-project — manage multiple independent headless Ghidra MCP projects
+  ghidra-project add  <name> [--bins f1,f2,..|--manifest PATH] [--lang ID] [--base ADDR] [--loader L] [--default P]
+  ghidra-project list
+  ghidra-project rm   <name> [--purge]
+Each project => systemd ghidra-headless@<name>/ghidra-mcp@<name> + mcpproxy upstream ghidra-<name>.
+USG
+     exit 2;;
+esac
