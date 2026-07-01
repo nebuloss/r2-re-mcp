@@ -42,6 +42,7 @@ $STD apt-get install -y \
   python3 python3-pip python3-venv \
   nodejs npm \
   build-essential pkg-config \
+  meson ninja-build cmake \
   binwalk ripgrep universal-ctags
 msg_ok "Installed Dependencies"
 
@@ -86,8 +87,13 @@ msg_info "Installing radare2 (+ r2ghidra/r2dec decompiler plugins)"
 git clone --depth 1 https://github.com/radareorg/radare2 /opt/radare2
 (cd /opt/radare2 && $STD ./sys/install.sh)
 $STD r2pm -U
-# Decompiler plugins the custom server's decompile/pdg path uses.
-$STD r2pm -ci r2ghidra r2dec || true
+# Decompiler plugins the custom server's decompile/pdg path uses. r2ghidra/r2dec
+# build via meson+ninja (installed above); r2ghidra ALSO needs r2ghidra-sleigh
+# (processor specs) or `pdg` fails "No languages available".
+$STD r2pm -ci r2ghidra r2ghidra-sleigh r2dec || true
+r2 -qc 'pdg?' /bin/true 2>/dev/null | grep -qi 'Native Ghidra' \
+  && msg_ok "r2ghidra pdg OK" \
+  || msg_error "r2ghidra 'pdg' unavailable — check meson/ninja/cmake + r2ghidra-sleigh"
 msg_ok "Installed radare2"
 
 msg_info "Building custom r2-re-mcp server (replaces stock r2mcp)"

@@ -60,6 +60,7 @@ apt-get install -y --no-install-recommends \
     python3 python3-pip python3-venv pipx \
     nodejs npm \
     build-essential pkg-config \
+    meson ninja-build cmake \
     binwalk ripgrep universal-ctags
 
 # ---- 2. Ghidra ------------------------------------------------------------
@@ -124,9 +125,18 @@ if ! command -v r2 >/dev/null; then
   ( cd /opt/radare2 && ./sys/install.sh )
 fi
 # Decompiler plugins the custom server's decompile/pdg path uses (r2ghidra + r2dec).
-log "r2 decompiler plugins (r2ghidra + r2dec)"
+# NOTE: r2ghidra/r2dec build via meson+ninja (installed above); r2ghidra ALSO needs
+# r2ghidra-sleigh (processor .sla/.cspec specs) or `pdg` fails "No languages available".
+# r2pm -U first to populate the plugin DB. Do NOT blanket `|| true` the whole thing —
+# verify `pdg` actually loads at the end so a missing dep can't fail silently again.
+log "r2 decompiler plugins (r2ghidra + r2ghidra-sleigh + r2dec)"
 r2pm -U || true
-r2pm -ci r2ghidra r2dec || true
+r2pm -ci r2ghidra r2ghidra-sleigh r2dec || true
+if r2 -qc 'pdg?' /bin/true 2>/dev/null | grep -qi 'Native Ghidra'; then
+  log "r2ghidra pdg OK"
+else
+  echo "WARNING: r2ghidra 'pdg' not available — check meson/ninja/cmake + r2ghidra-sleigh" >&2
+fi
 
 # Build + install THIS repo's custom radare2 RE MCP server (replaces stock r2mcp).
 # Node/npm were installed in step 1; verify before building.
